@@ -438,12 +438,7 @@ This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) 
 
 **⚠️ NOT FINANCIAL ADVICE**
 
-This software is for **educational and research purposes only**. The algorithms, strategies, and tools provided:
-
-- Are not guaranteed to be profitable
-- May result in significant financial losses
-- Should not be used for actual trading without thorough testing
-- Do not constitute investment advice or recommendations
+This software is for **educational and research purposes only**.
 
 **Always consult with qualified financial professionals before making investment decisions. Past performance does not guarantee future results.**
 
