@@ -7,6 +7,40 @@ Implements ML-based stock selection strategies:
 - Feature engineering
 - Model training and prediction
 - Sector-neutral portfolio construction
+- Multiple weight allocation methods:
+  * Equal weight: 等权重分配（默认）
+  * Min variance: 最小方差权重分配（自动使用基本面数据中的 adj_close_q）
+
+Usage:
+    # 使用等权重
+    result = strategy.generate_weights(
+        data_dict,
+        prediction_mode='single',
+        weight_method='equal'
+    )
+    
+    # 使用最小方差权重（自动使用基本面数据中的 adj_close_q 列计算）
+    data_dict = {
+        'fundamentals': fundamentals_df  # 必须包含 adj_close_q 列
+    }
+    result = strategy.generate_weights(
+        data_dict,
+        prediction_mode='single',
+        weight_method='min_variance',
+        lookback_periods=8  # 回溯季度数（默认8，即2年）
+    )
+    
+    # 也可以使用日度价格数据
+    data_dict = {
+        'fundamentals': fundamentals_df,
+        'prices': prices_df  # 包含 ['date', 'tic', 'close']
+    }
+    result = strategy.generate_weights(
+        data_dict,
+        prediction_mode='single',
+        weight_method='min_variance',
+        lookback_periods=252  # 回溯交易日数
+    )
 """
 
 import logging
@@ -21,6 +55,7 @@ from sklearn.linear_model import LinearRegression, Ridge, Lasso
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split, TimeSeriesSplit
 from sklearn.metrics import mean_squared_error, r2_score
+from scipy.optimize import minimize
 
 import os
 import sys
@@ -45,6 +80,249 @@ class MLStockSelectionStrategy(BaseStrategy):
             config: Strategy configuration
         """
         super().__init__(config)
+
+    def _compute_min_variance_weights(self, 
+                                     selected_gvkeys: List[str], 
+                                     price_data: pd.DataFrame,
+                                     lookback_periods: int = 8) -> pd.DataFrame:
+        """
+        计算最小方差权重。
+        
+        Args:
+            selected_gvkeys: 选中的股票列表
+            price_data: 价格数据，支持以下格式：
+                - 日度数据：包含 ['date', 'tic'/'gvkey', 'close'] 列
+                - 季度数据（基本面）：包含 ['datadate', 'gvkey'/'tic', 'adj_close_q'] 列
+            lookback_periods: 回溯期数用于计算协方差矩阵
+                - 如果是日度数据，建议设置为交易日数（如252）
+                - 如果是季度数据，建议设置为季度数（如8，即2年）
+            
+        Returns:
+            包含 ['gvkey', 'weight'] 的 DataFrame
+        """
+        try:
+            # 确定股票标识列
+            ticker_col = 'gvkey' if 'gvkey' in price_data.columns else 'tic'
+            
+            # 确定日期列和价格列
+            if 'datadate' in price_data.columns and 'adj_close_q' in price_data.columns:
+                # 季度基本面数据
+                date_col = 'datadate'
+                price_col = 'adj_close_q'
+                self.logger.info("使用基本面数据中的季度价格（adj_close_q）计算最小方差权重")
+            elif 'date' in price_data.columns:
+                # 日度价格数据
+                date_col = 'date'
+                price_col = 'close' if 'close' in price_data.columns else 'adj_close'
+                self.logger.info(f"使用日度价格数据（{price_col}）计算最小方差权重")
+            else:
+                self.logger.warning("价格数据格式不符合要求，回退到等权重")
+                return self._compute_equal_weights(selected_gvkeys)
+            
+            # 筛选选中的股票
+            selected_prices = price_data[price_data[ticker_col].isin(selected_gvkeys)].copy()
+            
+            if len(selected_prices) == 0:
+                self.logger.warning("无价格数据，回退到等权重")
+                return self._compute_equal_weights(selected_gvkeys)
+            
+            # 确保日期列是datetime类型
+            selected_prices[date_col] = pd.to_datetime(selected_prices[date_col])
+            selected_prices = selected_prices.sort_values(date_col)
+            
+            # 取最近的 lookback_periods 期
+            # 对于季度数据，这意味着最近N个季度；对于日度数据，意味着最近N天
+            unique_dates = selected_prices[date_col].unique()
+            if len(unique_dates) > lookback_periods:
+                cutoff_date = sorted(unique_dates)[-lookback_periods]
+                selected_prices = selected_prices[selected_prices[date_col] >= cutoff_date]
+            
+            # 透视为宽表格式：date x ticker
+            pivot_prices = selected_prices.pivot_table(
+                index=date_col, 
+                columns=ticker_col, 
+                values=price_col, 
+                aggfunc='last'
+            )
+            
+            # 计算收益率
+            returns = pivot_prices.pct_change().dropna()
+            
+            # 最小数据点要求：至少3个观测期（可以是3个季度或3个交易日）
+            min_periods = 3
+            if len(returns) < min_periods:
+                self.logger.warning(f"收益率数据不足（{len(returns)}期），至少需要{min_periods}期，回退到等权重")
+                return self._compute_equal_weights(selected_gvkeys)
+            
+            # 处理缺失值：只保留数据完整的股票
+            valid_cols = returns.columns[returns.notna().all()]
+            if len(valid_cols) == 0:
+                self.logger.warning("无完整数据的股票，回退到等权重")
+                return self._compute_equal_weights(selected_gvkeys)
+            
+            returns = returns[valid_cols]
+            
+            # 计算协方差矩阵
+            cov_matrix = returns.cov().values
+            n_assets = len(valid_cols)
+            
+            # 优化目标：最小化组合方差
+            def portfolio_variance(weights):
+                return weights.T @ cov_matrix @ weights
+            
+            # 约束：权重和为1
+            constraints = {'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0}
+            
+            # 边界：权重在 [0, 1] 之间（不允许做空）
+            bounds = tuple((0, 1) for _ in range(n_assets))
+            
+            # 初始猜测：等权重
+            initial_weights = np.array([1.0 / n_assets] * n_assets)
+            
+            # 优化求解
+            result = minimize(
+                portfolio_variance,
+                initial_weights,
+                method='SLSQP',
+                bounds=bounds,
+                constraints=constraints,
+                options={'maxiter': 1000}
+            )
+            
+            if not result.success:
+                self.logger.warning(f"最小方差优化失败: {result.message}，回退到等权重")
+                return self._compute_equal_weights(selected_gvkeys)
+            
+            # 构建权重 DataFrame
+            weights_df = pd.DataFrame({
+                'gvkey': valid_cols.tolist(),
+                'weight': result.x
+            })
+            
+            # 对于没有价格数据的股票，分配0权重
+            missing_gvkeys = set(selected_gvkeys) - set(valid_cols)
+            if missing_gvkeys:
+                self.logger.info(f"以下股票无足够价格数据，权重为0: {missing_gvkeys}")
+                missing_df = pd.DataFrame({
+                    'gvkey': list(missing_gvkeys),
+                    'weight': [0.0] * len(missing_gvkeys)
+                })
+                weights_df = pd.concat([weights_df, missing_df], ignore_index=True)
+            
+            # 重新归一化以确保和为1
+            total = weights_df['weight'].sum()
+            if total > 0:
+                weights_df['weight'] = weights_df['weight'] / total
+            
+            self.logger.info(f"最小方差权重计算成功，组合方差: {result.fun:.6f}")
+            return weights_df
+            
+        except Exception as e:
+            self.logger.error(f"最小方差权重计算失败: {e}，回退到等权重")
+            return self._compute_equal_weights(selected_gvkeys)
+    
+    def _compute_equal_weights(self, selected_gvkeys: List[str]) -> pd.DataFrame:
+        """
+        计算等权重。
+        
+        Args:
+            selected_gvkeys: 选中的股票列表
+            
+        Returns:
+            包含 ['gvkey', 'weight'] 的 DataFrame
+        """
+        n = len(selected_gvkeys)
+        if n == 0:
+            return pd.DataFrame(columns=['gvkey', 'weight'])
+        
+        weight = 1.0 / n
+        return pd.DataFrame({
+            'gvkey': selected_gvkeys,
+            'weight': [weight] * n
+        })
+    
+    def allocate_weights(self, 
+                        selected_stocks: pd.DataFrame,
+                        method: str = 'equal',
+                        price_data: Optional[pd.DataFrame] = None,
+                        fundamentals: Optional[pd.DataFrame] = None,
+                        **kwargs) -> pd.DataFrame:
+        """
+        为选中的股票分配权重。
+        
+        Args:
+            selected_stocks: 选中的股票 DataFrame，必须包含 'gvkey' 列，可能包含 'predicted_return' 等列
+            method: 权重分配方法，可选 'equal'（等权重）或 'min_variance'（最小方差）
+            price_data: 日度价格数据（用于 min_variance 方法），需包含 ['date', 'tic'/'gvkey', 'close']
+            fundamentals: 基本面数据（用于 min_variance 方法，优先级高于 price_data），
+                         需包含 ['datadate', 'gvkey'/'tic', 'adj_close_q']
+            **kwargs: 其他参数
+                - lookback_periods: 最小方差方法的回溯期数
+                    * 使用季度数据时，默认8（2年）
+                    * 使用日度数据时，默认252（1年）
+        
+        Returns:
+            包含 ['gvkey', 'weight', ...] 的 DataFrame，保留 selected_stocks 中的其他列
+        """
+        if len(selected_stocks) == 0:
+            return selected_stocks.copy()
+        
+        selected_gvkeys = selected_stocks['gvkey'].tolist()
+        
+        # 根据方法分配权重
+        if method == 'min_variance':
+            # 优先使用基本面数据中的季度价格
+            if fundamentals is not None and len(fundamentals) > 0:
+                if 'adj_close_q' in fundamentals.columns:
+                    # 使用季度数据，默认回溯8个季度（2年）
+                    lookback_periods = kwargs.get('lookback_periods', 8)
+                    weights_df = self._compute_min_variance_weights(
+                        selected_gvkeys, 
+                        fundamentals, 
+                        lookback_periods
+                    )
+                else:
+                    self.logger.warning("基本面数据中缺少 adj_close_q 列，尝试使用 price_data")
+                    if price_data is None or len(price_data) == 0:
+                        self.logger.warning("无可用价格数据，回退到等权重")
+                        weights_df = self._compute_equal_weights(selected_gvkeys)
+                    else:
+                        # 使用日度数据，默认回溯252天（1年）
+                        lookback_periods = kwargs.get('lookback_periods', 252)
+                        weights_df = self._compute_min_variance_weights(
+                            selected_gvkeys, 
+                            price_data, 
+                            lookback_periods
+                        )
+            elif price_data is not None and len(price_data) > 0:
+                # 使用日度数据，默认回溯252天（1年）
+                lookback_periods = kwargs.get('lookback_periods', 252)
+                weights_df = self._compute_min_variance_weights(
+                    selected_gvkeys, 
+                    price_data, 
+                    lookback_periods
+                )
+            else:
+                self.logger.warning("min_variance 方法需要价格数据（fundamentals或price_data），回退到等权重")
+                weights_df = self._compute_equal_weights(selected_gvkeys)
+        elif method == 'equal':
+            weights_df = self._compute_equal_weights(selected_gvkeys)
+        else:
+            self.logger.warning(f"未知的权重分配方法: {method}，使用等权重")
+            weights_df = self._compute_equal_weights(selected_gvkeys)
+        
+        # 合并权重到原始 DataFrame
+        result = selected_stocks.copy()
+        result = result.merge(weights_df[['gvkey', 'weight']], on='gvkey', how='left', suffixes=('_old', ''))
+        
+        # 如果有旧的 weight 列，删除它
+        if 'weight_old' in result.columns:
+            result = result.drop(columns=['weight_old'])
+        
+        # 填充缺失权重为0
+        result['weight'] = result['weight'].fillna(0.0)
+        
+        return result
 
 
     def _build_candidate_models(self) -> Dict[str, Any]:
@@ -393,6 +671,8 @@ class MLStockSelectionStrategy(BaseStrategy):
 
         # 4) 选股与权重分配
         top_quantile = float(kwargs.get('top_quantile', 0.75))
+        weight_method = str(kwargs.get('weight_method', 'equal')).lower()
+        price_data = data.get('prices', None)  # 获取日度价格数据（用于 min_variance，可选）
 
         if prediction_mode == 'rolling':
             # 对每个 trade date 独立选股与组内归一化，输出所有日期
@@ -408,7 +688,15 @@ class MLStockSelectionStrategy(BaseStrategy):
                 sel = g[g['predicted_return'] >= thr][['gvkey', 'predicted_return']].copy()
                 if len(sel) == 0:
                     continue
-                sel['weight'] = 1.0 / len(sel)
+                
+                # 使用新的权重分配函数（优先使用基本面数据中的价格）
+                sel = self.allocate_weights(
+                    selected_stocks=sel,
+                    method=weight_method,
+                    fundamentals=fundamentals,
+                    price_data=price_data,
+                    **kwargs
+                )
                 sel['date'] = dt
                 # 组内应用风控并归一
                 sel = self.apply_risk_limits(sel[['gvkey', 'weight', 'predicted_return', 'date']])
@@ -450,16 +738,20 @@ class MLStockSelectionStrategy(BaseStrategy):
                 )
 
             threshold = pred_df['predicted_return'].quantile(top_quantile)
-            selected = pred_df[pred_df['predicted_return'] >= threshold]
+            selected = pred_df[pred_df['predicted_return'] >= threshold][['gvkey', 'predicted_return']].copy()
 
             if len(selected) == 0:
                 self.logger.warning("没有股票达到阈值")
                 weights_df = pd.DataFrame(columns=['gvkey', 'weight', 'predicted_return'])
             else:
-                weight = 1.0 / len(selected)
-                weights_df = selected[['gvkey', 'predicted_return']].copy()
-                weights_df['weight'] = weight
-                weights_df = weights_df[['gvkey', 'weight', 'predicted_return']]
+                # 使用新的权重分配函数（优先使用基本面数据中的价格）
+                weights_df = self.allocate_weights(
+                    selected_stocks=selected,
+                    method=weight_method,
+                    fundamentals=fundamentals,
+                    price_data=price_data,
+                    **kwargs
+                )
                 weights_df['date'] = meta.get('trade_date')
 
                 # 应用风控限制与归一化
@@ -520,6 +812,8 @@ class SectorNeutralMLStrategy(MLStockSelectionStrategy):
         test_quarters = int(kwargs.get('test_quarters', 4))
         train_quarters = int(kwargs.get('train_quarters', 16))
         top_quantile = float(kwargs.get('top_quantile', 0.75))
+        weight_method = str(kwargs.get('weight_method', 'equal')).lower()
+        price_data = data.get('prices', None)  # 获取日度价格数据（用于 min_variance，可选）
 
         selected_all = []
         per_sector_meta: Dict[str, Any] = {}
@@ -607,7 +901,15 @@ class SectorNeutralMLStrategy(MLStockSelectionStrategy):
                 if g.empty:
                     continue
                 g = g[['gvkey', 'predicted_return', 'sector']].copy()
-                g['weight'] = 1.0 / len(g)
+                
+                # 使用新的权重分配函数（优先使用基本面数据中的价格）
+                g = self.allocate_weights(
+                    selected_stocks=g,
+                    method=weight_method,
+                    fundamentals=fundamentals,
+                    price_data=price_data,
+                    **kwargs
+                )
                 g['date'] = dt
                 g = self.apply_risk_limits(g[['gvkey', 'weight', 'predicted_return', 'sector', 'date']])
                 weights_list.append(g)
@@ -634,9 +936,16 @@ class SectorNeutralMLStrategy(MLStockSelectionStrategy):
             return result
         else:
             # 单一日期：全局等权并风控归一（保持原逻辑）
-            weight = 1.0 / len(merged)
             weights_df = merged[['gvkey', 'predicted_return', 'sector']].copy()
-            weights_df['weight'] = weight
+            
+            # 使用新的权重分配函数（优先使用基本面数据中的价格）
+            weights_df = self.allocate_weights(
+                selected_stocks=weights_df,
+                method=weight_method,
+                fundamentals=fundamentals,
+                price_data=price_data,
+                **kwargs
+            )
             weights_df['date'] = pred_df['date'].iloc[0] if 'date' in pred_df.columns and len(pred_df) > 0 else meta.get('trade_date')
             weights_df = weights_df[['gvkey', 'weight', 'predicted_return', 'sector', 'date']]
 
@@ -671,10 +980,10 @@ if __name__ == "__main__":
     # end_date = datetime.now().strftime('%Y-%m-%d')
     # fundamentals = fetch_fundamental_data(tickers, start_date, end_date)
 
-    # fundamentals = pd.read_csv('./data/cache/fundamentals.csv')
-    fundamentals = pd.read_csv(r'D:\Projects\FinRL-Trading-old\output_20250712\output_20250712\final_ratios.csv')
-    fundamentals['datadate'] = fundamentals['date']
-    fundamentals['gvkey'] = fundamentals['tic']
+    fundamentals = pd.read_csv('data/fundamentals.csv')
+    # fundamentals = pd.read_csv(r'D:\Projects\FinRL-Trading-old\output_20250712\output_20250712\final_ratios.csv')
+    # fundamentals['datadate'] = fundamentals['date']
+    # fundamentals['gvkey'] = fundamentals['tic']
 
     fundamentals = fundamentals[(fundamentals['datadate'] <= '2025-03-01') & (fundamentals['datadate'] >= '2019-03-01')]
     # 仅保留包含 y_return 的样本
@@ -695,26 +1004,44 @@ if __name__ == "__main__":
     target_date = sorted(pd.to_datetime(fundamentals['datadate']).unique())[-1] if len(fundamentals) else None
 
     strategy = MLStockSelectionStrategy(config)
-    # 单次模式
+    # 单次模式 - 等权重
     result_single = strategy.generate_weights(
         data_dict,
         test_quarters=4,
         top_quantile=0.75,
-        prediction_mode='single'
+        prediction_mode='single',
+        weight_method='equal'
     )
-    print(f"Strategy(single): {result_single.strategy_name}")
+    print(f"Strategy(single-equal): {result_single.strategy_name}")
     print(f"Selected {len(result_single.weights)} stocks (single)")
     print(result_single.weights.head())
     result_single.weights.to_csv(r'.\data\ml_weights_single.csv', index=False)
 
-    # 滚动模式（多日期）
+    # 单次模式 - 最小方差（使用基本面数据中的 adj_close_q）
+    # 注意：基本面数据已包含 adj_close_q 列，无需额外提供价格数据
+    result_single_mv = strategy.generate_weights(
+        data_dict,
+        test_quarters=4,
+        top_quantile=0.75,
+        prediction_mode='single',
+        weight_method='min_variance',
+        lookback_periods=8  # 回溯8个季度（2年）
+    )
+    print(f"\nStrategy(single-min_variance): {result_single_mv.strategy_name}")
+    print(f"Selected {len(result_single_mv.weights)} stocks")
+    print(result_single_mv.weights.head())
+    print(result_single_mv.weights[['gvkey', 'weight']].head(10))
+    result_single_mv.weights.to_csv(r'.\data\ml_weights_single_mv.csv', index=False)
+
+    # 滚动模式（多日期）- 等权重
     result_rolling = strategy.generate_weights(
         data_dict,
         test_quarters=4,
         top_quantile=0.75,
-        prediction_mode='rolling'
+        prediction_mode='rolling',
+        weight_method='equal'
     )
-    print(f"\nStrategy(rolling): {result_rolling.strategy_name}")
+    print(f"\nStrategy(rolling-equal): {result_rolling.strategy_name}")
     print(f"Rows: {len(result_rolling.weights)}, dates: {result_rolling.weights['date'].nunique() if 'date' in result_rolling.weights.columns else 0}")
     print(result_rolling.weights.head())
     result_rolling.weights.to_csv(r'.\data\ml_weights.csv', index=False)
@@ -727,30 +1054,52 @@ if __name__ == "__main__":
     )
     sector_strategy = SectorNeutralMLStrategy(sector_config)
 
-    # 行业-单次
+    # 行业-单次 - 等权重
     sector_single = sector_strategy.generate_weights(
         data_dict,
         test_quarters=4,
         top_quantile=0.75,
-        prediction_mode='single'
+        prediction_mode='single',
+        weight_method='equal'
     )
     if len(sector_single.weights) > 0 and ('sector' in sector_single.weights.columns):
-        print(f"\nSector-neutral(single) selected {len(sector_single.weights)} stocks")
+        print(f"\nSector-neutral(single-equal) selected {len(sector_single.weights)} stocks")
         print(sector_single.weights.groupby('sector')['weight'].sum())
         sector_single.weights.to_csv(r'.\data\ml_weights_sector_single.csv', index=False)
 
-    # 行业-滚动（多日期）
+    # 行业-滚动（多日期）- 等权重
     sector_rolling = sector_strategy.generate_weights(
         data_dict,
         test_quarters=4,
         top_quantile=0.75,
-        prediction_mode='rolling'
+        prediction_mode='rolling',
+        weight_method='equal'
     )
     if len(sector_rolling.weights) > 0 and ('sector' in sector_rolling.weights.columns):
-        print(f"\nSector-neutral(rolling) rows {len(sector_rolling.weights)}, dates {sector_rolling.weights['date'].nunique() if 'date' in sector_rolling.weights.columns else 0}")
+        print(f"\nSector-neutral(rolling-equal) rows {len(sector_rolling.weights)}, dates {sector_rolling.weights['date'].nunique() if 'date' in sector_rolling.weights.columns else 0}")
         # 展示每日每行业权重和应为1（按日内归一）
         try:
             print(sector_rolling.weights.groupby(['date','sector'])['weight'].sum().head())
         except Exception:
             pass
         sector_rolling.weights.to_csv(r'.\data\ml_weights_sector.csv', index=False)
+    
+    # 行业-滚动（多日期）- 最小方差（使用基本面数据中的 adj_close_q）
+    sector_rolling_mv = sector_strategy.generate_weights(
+        data_dict,
+        test_quarters=4,
+        top_quantile=0.75,
+        prediction_mode='rolling',
+        weight_method='min_variance',
+        lookback_periods=8  # 回溯8个季度
+    )
+    if len(sector_rolling_mv.weights) > 0:
+        print(f"\nSector-neutral(rolling-min_variance) rows {len(sector_rolling_mv.weights)}, dates {sector_rolling_mv.weights['date'].nunique() if 'date' in sector_rolling_mv.weights.columns else 0}")
+        # 展示前几个日期的权重分布
+        try:
+            first_date = sorted(sector_rolling_mv.weights['date'].unique())[0]
+            print(f"\n第一个交易日 {first_date} 的权重分布（前10只）:")
+            print(sector_rolling_mv.weights[sector_rolling_mv.weights['date']==first_date][['gvkey', 'weight', 'sector']].head(10))
+        except Exception:
+            pass
+        sector_rolling_mv.weights.to_csv(r'.\data\ml_weights_sector_mv.csv', index=False)
