@@ -138,6 +138,7 @@ temp/
 tmp/
 SecretDoc/
 examples/data/
+awsConnect
 
 # IDE
 .vscode/

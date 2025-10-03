@@ -565,7 +565,8 @@ class FMPFetcher(BaseDataFetcher, DataSource):
             from src.config.settings import get_config
             config = get_config()
             return bool(config.fmp.api_key)
-        except:
+        except Exception as e:
+            logger.error(f"Failed to check FMP API availability: {e}")
             return False
 
     def _get_api_key(self) -> Optional[str]:
@@ -576,7 +577,8 @@ class FMPFetcher(BaseDataFetcher, DataSource):
             if config.fmp.api_key:
                 return config.fmp.api_key.get_secret_value()
             return None
-        except:
+        except Exception as e:
+            logger.error(f"Failed to get FMP API key: {e}")
             return None
 
     def _fetch_fmp_data(self, ticker: str, endpoint: str, period: str) -> List[Dict[str, Any]]:

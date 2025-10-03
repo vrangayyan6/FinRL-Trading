@@ -41,10 +41,7 @@ flake8>=6.1.0
 mypy>=1.7.0
 
 # Optional: Deep learning capabilities
-tensorflow>=2.13.0
 torch>=2.0.0
-gymnasium>=0.29.0
-stable-baselines3>=2.1.0
 
 # Documentation
 sphinx>=7.2.0
