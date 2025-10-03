@@ -161,8 +161,8 @@ class YahooFinanceFetcher(BaseDataFetcher, DataSource):
         super().__init__(cache_dir)
 
     def is_available(self) -> bool:
-        """Yahoo Finance is always available (free)."""
-        return True
+        """Yahoo Finance is always available (free). # TODO: Yahoo fetcher does not work. Need to fix."""
+        return False
 
     def get_sp500_components(self, date: str = None) -> pd.DataFrame:
         """Get S&P 500 components from Wikipedia."""
