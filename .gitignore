@@ -137,6 +137,7 @@ logs/
 temp/
 tmp/
 SecretDoc/
+examples/data/
 
 # IDE
 .vscode/
