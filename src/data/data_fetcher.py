@@ -1196,8 +1196,17 @@ class WRDSFetcher(BaseDataFetcher, DataSource):
 class DataSourceManager:
     """Manager for multiple data sources with automatic fallback."""
 
-    def __init__(self, cache_dir: str = "./data/cache"):
+    def __init__(self, cache_dir: str = "./data/cache", preferred_source: Optional[str] = None):
+        """
+        Initialize DataSourceManager.
+        
+        Args:
+            cache_dir: Directory for caching data
+            preferred_source: Preferred data source name ('FMP', 'WRDS', 'Yahoo'), 
+                            None for automatic selection
+        """
         self.cache_dir = cache_dir
+        self.preferred_source = preferred_source
 
         # Initialize data sources in priority order
         self.data_sources = [
@@ -1211,6 +1220,21 @@ class DataSourceManager:
 
     def _select_best_source(self):
         """Select the best available data source."""
+        # If a preferred source is specified, try to use it first
+        if self.preferred_source:
+            preferred_source_upper = self.preferred_source.upper()
+            for name, source in self.data_sources:
+                if name.upper() == preferred_source_upper:
+                    if source.is_available():
+                        self.current_source = source
+                        self.current_source_name = name
+                        logger.info(f"Using preferred data source: {name}")
+                        return
+                    else:
+                        logger.warning(f"Preferred data source '{name}' is not available, falling back to automatic selection")
+                        break
+        
+        # Automatic selection (priority order)
         for name, source in self.data_sources:
             if source.is_available():
                 self.current_source = source
@@ -1256,19 +1280,46 @@ class DataSourceManager:
 
 # Global data source manager instance
 _data_manager = None
+_data_manager_config = {}
 
-def get_data_manager(cache_dir: str = "./data/cache") -> DataSourceManager:
-    """Get global data source manager instance."""
-    global _data_manager
-    if _data_manager is None:
-        _data_manager = DataSourceManager(cache_dir)
+def get_data_manager(cache_dir: str = "./data/cache", preferred_source: Optional[str] = None) -> DataSourceManager:
+    """
+    Get global data source manager instance.
+    
+    Args:
+        cache_dir: Directory for caching data
+        preferred_source: Preferred data source name ('FMP', 'WRDS', 'Yahoo'), 
+                        None for automatic selection
+    
+    Returns:
+        DataSourceManager instance
+        
+    Examples:
+        # Automatic selection (default)
+        manager = get_data_manager()
+        
+        # Force use Yahoo Finance
+        manager = get_data_manager(preferred_source='Yahoo')
+        
+        # Force use FMP (if API key is configured)
+        manager = get_data_manager(preferred_source='FMP')
+    """
+    global _data_manager, _data_manager_config
+    
+    # Check if we need to recreate the manager
+    current_config = {'cache_dir': cache_dir, 'preferred_source': preferred_source}
+    
+    if _data_manager is None or _data_manager_config != current_config:
+        _data_manager = DataSourceManager(cache_dir, preferred_source)
+        _data_manager_config = current_config
+        
     return _data_manager
 
 
 # Convenience functions for backward compatibility
-def fetch_sp500_tickers(output_path: str = "./data/sp500_tickers.txt") -> List[str]:
+def fetch_sp500_tickers(output_path: str = "./data/sp500_tickers.txt", preferred_source='FMP') -> List[str]:
     """Fetch S&P 500 tickers and save to file."""
-    manager = get_data_manager()
+    manager = get_data_manager(preferred_source=preferred_source)
     components = manager.get_sp500_components()
     tickers = manager.get_unique_tickers(components)
 
@@ -1285,9 +1336,9 @@ def fetch_sp500_tickers(output_path: str = "./data/sp500_tickers.txt") -> List[s
 
 
 def fetch_fundamental_data(tickers: List[str], start_date: str, end_date: str,
-                          output_path: str = "./data/fundamentals.csv", align_quarter_dates: bool = False) -> pd.DataFrame:
+                          output_path: str = "./data/fundamentals.csv", align_quarter_dates: bool = False, preferred_source='FMP') -> pd.DataFrame:
     """Fetch fundamental data for tickers."""
-    manager = get_data_manager()
+    manager = get_data_manager(preferred_source=preferred_source)
     df = manager.get_fundamental_data(tickers, start_date, end_date, align_quarter_dates)
 
     # Save to file
@@ -1300,9 +1351,9 @@ def fetch_fundamental_data(tickers: List[str], start_date: str, end_date: str,
 
 
 def fetch_price_data(tickers: List[str], start_date: str, end_date: str,
-                    output_path: str = "./data/prices.csv") -> pd.DataFrame:
+                    output_path: str = "./data/prices.csv", preferred_source='FMP') -> pd.DataFrame:
     """Fetch price data for tickers."""
-    manager = get_data_manager()
+    manager = get_data_manager(preferred_source=preferred_source)
     df = manager.get_price_data(tickers, start_date, end_date)
 
     # Save to file
