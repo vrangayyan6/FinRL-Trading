@@ -700,6 +700,9 @@ class FMPFetcher(BaseDataFetcher, DataSource):
                 # price data for quarter adj_close (need next quarter too)
                 prices = self.get_price_data([ticker], extended_start_date, extended_end_date)
                 prices_t = prices[prices['tic'] == ticker].copy() if not prices.empty else pd.DataFrame()
+                # 按日期降序排序，以便于向前查找最近价格时能正确获取
+                if not prices_t.empty and 'datadate' in prices_t.columns:
+                    prices_t = prices_t.sort_values('datadate', ascending=False)
 
                 # Index data by date for quick lookup
                 def index_by_date(items: List[Dict[str, Any]]) -> Dict[pd.Timestamp, Dict[str, Any]]:
@@ -772,12 +775,31 @@ class FMPFetcher(BaseDataFetcher, DataSource):
                     except Exception:
                         revenue = 0.0
 
-                    # price for aligned quarter date (on or before aligned_date)
+                    # price for aligned quarter date
                     prccd = np.nan
                     adj_close = np.nan
                     ajexdi = 1.0
                     if not prices_t.empty and 'datadate' in prices_t.columns:
-                        price_row = prices_t[prices_t['datadate'] <= aligned_date.strftime('%Y-%m-%d')].head(1)
+                        if align_quarter_dates:
+                            # 当align_quarter_dates为True时，优先取对齐日期当天或之后的第一个交易日价格
+                            # 如果对齐日期（3/1, 6/1, 9/1, 12/1）因周末或节假日没有数据，向后查找最多10个自然日
+                            aligned_date_str = aligned_date.strftime('%Y-%m-%d')
+                            max_days_forward = 10
+                            price_row = pd.DataFrame()
+                            
+                            for days_offset in range(max_days_forward + 1):
+                                search_date = (aligned_date + pd.Timedelta(days=days_offset)).strftime('%Y-%m-%d')
+                                price_row = prices_t[prices_t['datadate'] == search_date]
+                                if not price_row.empty:
+                                    break
+                            
+                            # 如果向后10天都没找到，则向前查找最近的交易日（兜底逻辑）
+                            if price_row.empty:
+                                price_row = prices_t[prices_t['datadate'] <= aligned_date_str].head(1)
+                        else:
+                            # 不对齐时，取对齐日期之前的最近价格
+                            price_row = prices_t[prices_t['datadate'] <= aligned_date.strftime('%Y-%m-%d')].head(1)
+                        
                         if not price_row.empty:
                             prccd = float(price_row.iloc[0].get('prccd', np.nan))
                             ac = price_row.iloc[0].get('adj_close', np.nan)
@@ -1381,15 +1403,15 @@ if __name__ == "__main__":
 
     # # 按字母顺序对tickers排序
     # tickers = sorted(tickers)
-    tickers = ["AEP", "DECK", "INCY", "LIN", "URI"]
+    tickers = ["AEP", "ADM", "INCY", "LIN", "URI"]
 
     # Fetch sample data
     fundamentals = fetch_fundamental_data(
-        tickers[:5], "2022-01-01", "2024-12-31", align_quarter_dates=True
+        tickers[:5], "2024-09-01", "2025-09-15", align_quarter_dates=True
     )
     print(f"Fetched {len(fundamentals)} fundamental records")
 
-    prices = fetch_price_data(
-        tickers[:5], "2022-01-01", "2025-12-31"
-    )
-    print(f"Fetched {len(prices)} price records")
+    # prices = fetch_price_data(
+    #     tickers[:5], "2022-01-01", "2025-12-31"
+    # )
+    # print(f"Fetched {len(prices)} price records")
