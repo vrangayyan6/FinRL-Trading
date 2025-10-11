@@ -396,10 +396,26 @@ class YahooFinanceFetcher(BaseDataFetcher, DataSource):
                                     continue
                         return None
 
+                    # 对齐函数，仅当 align_quarter_dates 为 True 时使用
+                    def align_to_mjsd_first(d: pd.Timestamp) -> pd.Timestamp:
+                        month = int(d.month)
+                        year = int(d.year)
+                        if month in (12, 1, 2):
+                            if month == 12:
+                                year = year + 1
+                            return pd.Timestamp(year=year, month=3, day=1)
+                        if month in (3, 4, 5):
+                            return pd.Timestamp(year=year, month=6, day=1)
+                        if month in (6, 7, 8):
+                            return pd.Timestamp(year=year, month=9, day=1)
+                        return pd.Timestamp(year=year, month=12, day=1)
+
                     for q_date in quarter_dates:
                         # quarter-end price
                         prccd = np.nan
                         adj_close = np.nan
+                        # 对齐日价格，仅用于 y_return
+                        adj_close_aligned = np.nan
                         ajexdi = 1.0
                         if not price_df.empty:
                             sub = price_df[price_df['Date'] <= q_date]
@@ -408,6 +424,28 @@ class YahooFinanceFetcher(BaseDataFetcher, DataSource):
                                 prccd = float(last_row.get('Close', np.nan))
                                 adj_close = float(last_row.get('Adj Close', prccd)) if pd.notna(last_row.get('Adj Close', np.nan)) else prccd
                                 ajexdi = (prccd / adj_close) if (pd.notna(prccd) and pd.notna(adj_close) and adj_close != 0) else 1.0
+
+                        # 若需要对齐，则计算对齐日的价格，作为 adj_close_q（仅用于 y_return）
+                        if align_quarter_dates and not price_df.empty:
+                            aligned_date = align_to_mjsd_first(q_date)
+                            # 优先取对齐日当天或之后的第一个交易日
+                            max_days_forward = 10
+                            price_row_aln = pd.DataFrame()
+                            for days_offset in range(max_days_forward + 1):
+                                search_date = (aligned_date + pd.Timedelta(days=days_offset))
+                                sub_aln = price_df[price_df['Date'] == search_date]
+                                if not sub_aln.empty:
+                                    price_row_aln = sub_aln
+                                    break
+                            if price_row_aln.empty:
+                                # 兜底：向前寻找最近交易日
+                                sub_aln2 = price_df[price_df['Date'] <= aligned_date]
+                                if not sub_aln2.empty:
+                                    price_row_aln = sub_aln2.head(1)
+                            if not price_row_aln.empty:
+                                ac_a = price_row_aln.head(1).iloc[0].get('Adj Close', np.nan)
+                                if pd.notna(ac_a):
+                                    adj_close_aligned = float(ac_a)
 
                         net_income = get_fin_value(q_fin, ['Net Income', 'NetIncome'], q_date) or 0.0
                         equity = get_fin_value(q_bs, ["Total Stockholder Equity", "Total Stockholders' Equity", 'Total Equity'], q_date)
@@ -426,9 +464,12 @@ class YahooFinanceFetcher(BaseDataFetcher, DataSource):
                             'gvkey': ticker,
                             'datadate': q_date.strftime('%Y-%m-%d'),
                             'tic': ticker,
+                            # 倍数等使用原始季度日价格
                             'prccd': prccd if pd.notna(prccd) else np.nan,
                             'ajexdi': ajexdi,
-                            'adj_close_q': adj_close if pd.notna(adj_close) else np.nan,
+                            # y_return 使用对齐后的 adj_close_q（若启用对齐）；否则为原始季度日的 adj_close
+                            'adj_close_q': (adj_close_aligned if align_quarter_dates and pd.notna(adj_close_aligned) else adj_close) if pd.notna(adj_close) or pd.notna(adj_close_aligned) else np.nan,
+                            # 原始季度日价格保存在 adj_close
                             'adj_close': adj_close if pd.notna(adj_close) else np.nan,
                             'pe': pe if pd.notna(pe) else np.nan,
                             'pb': pb if pd.notna(pb) else np.nan,
@@ -763,7 +804,7 @@ class FMPFetcher(BaseDataFetcher, DataSource):
                 all_quarter_dates = sorted(set(income_by_date.keys()) | set(balance_by_date.keys()) | set(ratios_by_date.keys()))
                 inrange_quarters = [d for d in all_quarter_dates if start_dt <= d <= end_dt]
 
-                # If aligning, create a mapping from original qd -> aligned date
+                # If aligning, create a mapping from original qd -> aligned date (仅用于计算 y_return 的价格)
                 if align_quarter_dates:
                     aligned_dates = {qd: align_to_mjsd_first(qd) for qd in inrange_quarters}
                 else:
@@ -803,38 +844,38 @@ class FMPFetcher(BaseDataFetcher, DataSource):
                     except Exception:
                         revenue = 0.0
 
-                    # price for aligned quarter date
-                    prccd = np.nan
-                    adj_close = np.nan
-                    ajexdi = 1.0
+                    # 价格：区分原始季度日与对齐日
+                    prccd_orig = np.nan
+                    adj_close_orig = np.nan
+                    prccd_aligned = np.nan
+                    adj_close_aligned = np.nan
                     if not prices_t.empty and 'datadate' in prices_t.columns:
+                        # 原始季度日价格：使用 qd 当天或之前最近的交易日
+                        qd_str = qd.strftime('%Y-%m-%d')
+                        price_row_orig = prices_t[prices_t['datadate'] <= qd_str].head(1)
+                        if not price_row_orig.empty:
+                            prccd_orig = float(price_row_orig.iloc[0].get('prccd', np.nan))
+                            ac_o = price_row_orig.iloc[0].get('adj_close', np.nan)
+                            if pd.notna(ac_o):
+                                adj_close_orig = float(ac_o)
+
+                        # 对齐日价格：仅当开启对齐时计算，用于 y_return
                         if align_quarter_dates:
-                            # 当align_quarter_dates为True时，优先取对齐日期当天或之后的第一个交易日价格
-                            # 如果对齐日期（3/1, 6/1, 9/1, 12/1）因周末或节假日没有数据，向后查找最多10个自然日
                             aligned_date_str = aligned_date.strftime('%Y-%m-%d')
                             max_days_forward = 10
-                            price_row = pd.DataFrame()
-                            
+                            price_row_aln = pd.DataFrame()
                             for days_offset in range(max_days_forward + 1):
                                 search_date = (aligned_date + pd.Timedelta(days=days_offset)).strftime('%Y-%m-%d')
-                                price_row = prices_t[prices_t['datadate'] == search_date]
-                                if not price_row.empty:
+                                price_row_aln = prices_t[prices_t['datadate'] == search_date]
+                                if not price_row_aln.empty:
                                     break
-                            
-                            # 如果向后10天都没找到，则向前查找最近的交易日（兜底逻辑）
-                            if price_row.empty:
-                                price_row = prices_t[prices_t['datadate'] <= aligned_date_str].head(1)
-                        else:
-                            # 不对齐时，取对齐日期之后的最近价格
-                            price_row = prices_t[prices_t['datadate'] >= aligned_date.strftime('%Y-%m-%d')].head(1)
-                        
-                        if not price_row.empty:
-                            prccd = float(price_row.iloc[0].get('prccd', np.nan))
-                            ac = price_row.iloc[0].get('adj_close', np.nan)
-                            if pd.notna(ac):
-                                adj_close = float(ac)
-                            if pd.notna(prccd) and pd.notna(adj_close) and adj_close != 0:
-                                ajexdi = prccd / adj_close
+                            if price_row_aln.empty:
+                                price_row_aln = prices_t[prices_t['datadate'] <= aligned_date_str].head(1)
+                            if not price_row_aln.empty:
+                                prccd_aligned = float(price_row_aln.iloc[0].get('prccd', np.nan))
+                                ac_a = price_row_aln.iloc[0].get('adj_close', np.nan)
+                                if pd.notna(ac_a):
+                                    adj_close_aligned = float(ac_a)
 
                     # EPS, BPS, DPS
                     eps = income_q.get('eps')
@@ -902,7 +943,7 @@ class FMPFetcher(BaseDataFetcher, DataSource):
                     pe = ratio_q.get('priceEarningsRatio')
                     if pe is None:
                         try:
-                            pe = (prccd / eps) if (pd.notna(prccd) and eps and eps != 0) else np.nan
+                            pe = (prccd_orig / eps) if (pd.notna(prccd_orig) and eps and eps != 0) else np.nan
                         except Exception:
                             pe = np.nan
 
@@ -910,7 +951,7 @@ class FMPFetcher(BaseDataFetcher, DataSource):
                     pb = ratio_q.get('priceToBookRatio')
                     if pb is None:
                         try:
-                            pb = (prccd / bps) if (pd.notna(prccd) and bps and bps != 0) else np.nan
+                            pb = (prccd_orig / bps) if (pd.notna(prccd_orig) and bps and bps != 0) else np.nan
                         except Exception:
                             pb = np.nan
 
@@ -921,10 +962,13 @@ class FMPFetcher(BaseDataFetcher, DataSource):
                         'datadate': aligned_date.strftime('%Y-%m-%d') if align_quarter_dates else qd.strftime('%Y-%m-%d'),
                         'tic': ticker,
                         'gsector': gsector,
-                        'prccd': prccd if pd.notna(prccd) else np.nan,
+                        # 基本面倍数等一律使用原始季度日价格
+                        'prccd': prccd_orig if pd.notna(prccd_orig) else np.nan,
                         # 'ajexdi': ajexdi,
-                        'adj_close_q': adj_close if pd.notna(adj_close) else np.nan,
-                        'adj_close': adj_close if pd.notna(adj_close) else np.nan,
+                        # y_return 所用价格：若对齐开启则用对齐价，否则用原始价
+                        'adj_close_q': (adj_close_aligned if align_quarter_dates and pd.notna(adj_close_aligned) else adj_close_orig) if pd.notna(adj_close_orig) or pd.notna(adj_close_aligned) else np.nan,
+                        # 记录原始季度日的调整收盘价，供特征/倍数使用
+                        'adj_close': adj_close_orig if pd.notna(adj_close_orig) else np.nan,
                         'EPS': eps if eps is not None else np.nan,
                         'BPS': bps if bps is not None else np.nan,
                         'DPS': dps if pd.notna(dps) else np.nan,

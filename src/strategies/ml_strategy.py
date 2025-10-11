@@ -530,7 +530,7 @@ class MLStockSelectionStrategy(BaseStrategy):
             raise ValueError("'y_return' 缺失，请使用 data_fetcher 获取的真实基本面数据")
 
         # Select numeric feature columns (exclude ids and label/date)
-        exclude_cols = {'gvkey', 'tic', 'gsector', 'datadate', 'y_return', 'prccd', 'ajexdi'}
+        exclude_cols = {'gvkey', 'tic', 'gsector', 'datadate', 'y_return', 'prccd', 'ajexdi', 'adj_close'}
         numeric_cols: List[str] = []
         for col in fundamentals.columns:
             if col in exclude_cols:
