@@ -300,7 +300,7 @@ def main():
     manager = AlpacaManager([account])
     
     # end_date = datetime.now(timezone.utc)
-    end_date = datetime(2025, 10, 6, tzinfo=timezone.utc)
+    end_date = datetime(2025, 10, 12, tzinfo=timezone.utc)
     first_order_date = get_first_order_date(manager)
     
     if not first_order_date:
@@ -308,7 +308,8 @@ def main():
         return
         
     # Adjust start date to be at least 1 day before for data fetching
-    start_date = first_order_date - timedelta(days=1)
+    # start_date = first_order_date - timedelta(days=1)
+    start_date = datetime(2025, 9, 28, tzinfo=timezone.utc)
     start_date_str = start_date.date().isoformat()
     fmp_end_date = end_date + timedelta(days=1)
     end_date_str = fmp_end_date.date().isoformat()
