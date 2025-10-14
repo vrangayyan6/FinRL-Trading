@@ -371,7 +371,8 @@ class FMPFetcher(BaseDataFetcher, DataSource):
                 ratios_by_date = index_by_date(ratios_data)
 
                 # in-range quarter dates
-                all_quarter_dates = sorted(set(income_by_date.keys()) | set(balance_by_date.keys()) | set(ratios_by_date.keys()))
+                # TODO: ratios and cashflow dates are different in NVDA, need to adapt to this case
+                all_quarter_dates = sorted(set(income_by_date.keys()) | set(balance_by_date.keys()) | set(cashflow_by_date.keys()))
                 inrange_quarters = [d for d in all_quarter_dates if start_dt <= d <= end_dt]
 
                 # If aligning, create a mapping from original qd -> aligned date (仅用于计算 y_return 的价格)
@@ -381,12 +382,18 @@ class FMPFetcher(BaseDataFetcher, DataSource):
                     aligned_dates = {qd: qd for qd in inrange_quarters}
 
                 for qd, aligned_date in aligned_dates.items():
-                    # if aligned_date > today:
+                    # if aligned_date > today: 
                     #     continue
                     income_q = income_by_date.get(qd, {})
                     balance_q = balance_by_date.get(qd, {})
                     cash_q = cashflow_by_date.get(qd, {})
                     ratio_q = ratios_by_date.get(qd, {})
+                    if ratio_q is None:
+                        # 尝试仅用年和月份匹配
+                        for rdate in ratios_by_date:
+                            if rdate.year == qd.year and rdate.month == qd.month:
+                                ratio_q = ratios_by_date[rdate]
+                                break
 
                     # shares outstanding
                     shares_out = balance_q.get('commonStockSharesOutstanding') or income_q.get('weightedAverageShsOutDil') or income_q.get('weightedAverageShsOut')
@@ -872,7 +879,8 @@ if __name__ == "__main__":
 
     # # 按字母顺序对tickers排序
     # tickers = sorted(tickers)
-    tickers = ["AEP", "ADM", "INCY", "LIN", "URI", "NVDA"]
+    # tickers = ["AEP", "ADM", "INCY", "LIN", "URI", "NVDA"]
+    tickers = ["NVDA"]
 
     # Fetch sample data
     end_date = datetime.now().strftime('%Y-%m-%d')
