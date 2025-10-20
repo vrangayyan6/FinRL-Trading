@@ -1,8 +1,14 @@
+# 1. updated to set dynamic date range : 
+# the start date is the first order date, and the end date is the current date
+# the start date is the first order date, and the end date is the current date
+# 2. updated to add run_multi_account_performance : 
+# loop accounts and print metrics/plot per account using existing functions.
+# Returns a dict of {account_name: portfolio_df} for further analysis.
 import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta, timezone
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional ,List
 # from alpaca_trade_api import REST as AlpacaAPI
 
 import os
@@ -14,7 +20,7 @@ sys.path.insert(0, os.path.join(project_root, 'src'))
 
 from src.config.settings import get_config
 from src.data.data_fetcher import fetch_price_data  # Assuming this is the fetcher class
-from src.trading.alpaca_manager import AlpacaManager, create_alpaca_account_from_env
+from src.trading.alpaca_manager import AlpacaManager, create_alpaca_account_from_env, create_multiple_accounts_from_config
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -42,7 +48,7 @@ def get_portfolio_history(manager: AlpacaManager, start_date: datetime, end_date
     history = manager.get_portfolio_history(
         timeframe='1D',
         date_start=start_date.date().isoformat(),
-        date_end=end_date.date().isoformat(),
+        date_end=end_date.date().isoformat(),  
         extended_hours=False
     )
     df = pd.DataFrame({
@@ -51,15 +57,20 @@ def get_portfolio_history(manager: AlpacaManager, start_date: datetime, end_date
         'profit_loss': history['profit_loss'],
         'profit_loss_pct': history['profit_loss_pct']
     })
+    print(f"[DEBUG] Portfolio history from {df['date'].min().date()} to {df['date'].max().date()}")
+
     return df
 
 def get_benchmark_data(start_date: str, end_date: str) -> pd.DataFrame:
     """Get historical price data for SPY and QQQ."""
+    #print(f"[DEBUG] Benchmark data from {start_date} to {end_date}")
     df = fetch_price_data(['SPY', 'QQQ'], start_date, end_date)
     df['date'] = pd.to_datetime(df['datadate'])
     df = df.pivot(index='date', columns='tic', values='adj_close')
     # 保留原有列名并明确列顺序，避免因列顺序变化导致 SPY/QQQ 对调
     df = df[[c for c in ['SPY', 'QQQ'] if c in df.columns]]
+    #print(df.tail(10))   
+
     return df
 
 def calculate_returns(df: pd.DataFrame, column: str) -> float:
@@ -292,6 +303,84 @@ def plot_performance(portfolio_df: pd.DataFrame, benchmark_df: pd.DataFrame):
     plt.tight_layout()
     plt.show()
 
+def _build_manager_from_env() -> AlpacaManager:
+    """
+    get nicknames from .env , and create multiple accounts from the config.
+    get API key/secret/base_url from the config.
+    """
+    names_raw = os.getenv("APCA_ACCOUNTS", "").strip()
+    if not names_raw:
+        # if no multi-account is configured, use the single account default
+        account = create_alpaca_account_from_env(name="default")
+        return AlpacaManager([account])
+
+    default_base = os.getenv("APCA_BASE_URL", "https://paper-api.alpaca.markets")
+    cfg: Dict[str, Dict[str, str]] = {}
+    for raw in [n.strip() for n in names_raw.split(",") if n.strip()]:
+        tag = raw.upper()
+        key = os.getenv(f"APCA_{tag}_API_KEY") or os.getenv("APCA_API_KEY")
+        sec = os.getenv(f"APCA_{tag}_API_SECRET") or os.getenv("APCA_API_SECRET")
+        base = os.getenv(f"APCA_{tag}_BASE_URL") or default_base
+        if not key or not sec:
+            raise ValueError(f"Missing API key/secret for account '{raw}' in .env")
+        cfg[raw] = {"api_key": key, "api_secret": sec, "base_url": base}
+
+    accounts = create_multiple_accounts_from_config(cfg)
+    return AlpacaManager(accounts)
+
+def run_multi_account_performance(manager: AlpacaManager,
+                                  account_names: Optional[List[str]] = None,
+                                  plot: bool = True) -> Dict[str, pd.DataFrame]:
+    """
+    Loop accounts and print metrics/plot per account using existing functions.
+    Returns a dict of {account_name: portfolio_df} for further analysis.
+    """
+    if account_names is None:
+        account_names = manager.get_available_accounts()
+
+    results: Dict[str, pd.DataFrame] = {}
+    for name in account_names:
+        try:
+            manager.set_account(name)
+
+            # per-account date window: first order - 1 day -> now
+            start = get_first_order_date(manager)
+            if not start:
+                print(f"[{name}] No order history. Skip.")
+                continue
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=timezone.utc)
+            start = start - timedelta(days=1)
+            end = datetime.now(timezone.utc)
+
+            # fetch data
+            pf = get_portfolio_history(manager, start, end)
+            bench = get_benchmark_data(start.date().isoformat(),
+                                       (end + timedelta(days=1)).date().isoformat())
+            # align benchmark to portfolio dates (reuse existing alignment logic downstream)
+
+            if not bench.empty and not pf.empty:
+                mask = np.isin(bench.index.date, pf['date'].dt.date.unique())
+                bench = bench[mask]
+
+            print(f"\n===== {name} =====")
+            if pf.empty or bench.empty:
+                print("No data available for this account/benchmark window.")
+                continue
+
+            # reuse existing displays
+            display_metrics_table(pf, bench)
+            if plot:
+                plot_performance(pf, bench)
+
+            results[name] = pf
+
+        except Exception as e:
+            print(f"[{name}] performance fetch failed: {e}")
+
+    return results
+'''
+signal accounts from .env, and create a manager from the config.
 def main():
     logging.basicConfig(level=logging.INFO)
     
@@ -299,8 +388,8 @@ def main():
     account = create_alpaca_account_from_env()
     manager = AlpacaManager([account])
     
-    # end_date = datetime.now(timezone.utc)
-    end_date = datetime(2025, 10, 12, tzinfo=timezone.utc)
+    # Use dynamic date range: from first order date (minus 1 day) to now
+    end_date = datetime.now(timezone.utc)
     first_order_date = get_first_order_date(manager)
     
     if not first_order_date:
@@ -308,8 +397,9 @@ def main():
         return
         
     # Adjust start date to be at least 1 day before for data fetching
-    # start_date = first_order_date - timedelta(days=1)
-    start_date = datetime(2025, 9, 28, tzinfo=timezone.utc)
+    if first_order_date.tzinfo is None:
+        first_order_date = first_order_date.replace(tzinfo=timezone.utc)
+    start_date = first_order_date - timedelta(days=1)
     start_date_str = start_date.date().isoformat()
     fmp_end_date = end_date + timedelta(days=1)
     end_date_str = fmp_end_date.date().isoformat()
@@ -331,6 +421,58 @@ def main():
     # display_table(portfolio_df, benchmark_df)
     display_metrics_table(portfolio_df, benchmark_df)
     plot_performance(portfolio_df, benchmark_df)
+'''
+#multi-account performance analyzer
+def main():
+    logging.basicConfig(level=logging.INFO)
+
+    manager = _build_manager_from_env()
+    names: List[str] = manager.get_available_accounts()
+    print(f"Accounts loaded: {names}")
+
+    for name in names:
+        try:
+            manager.set_account(name)
+
+            # per-account date window: first order - 1 day -> now
+            start = get_first_order_date(manager)
+            if not start:
+                print(f"[{name}] No order history. Skip.")
+                continue
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=timezone.utc)
+            start = start - timedelta(days=1)
+            end = datetime.now(timezone.utc)
+            print(f"start is {start}")
+            print(f"end is { end.date().isoformat()}")
+            print(f'input end-data is {(end + timedelta(days=1)).date().isoformat()}')
+
+            # fetch data
+            pf = get_portfolio_history(manager, start, end)
+            bench = get_benchmark_data(start.date().isoformat(), (end + timedelta(days=1)).date().isoformat())
+
+           # print("\n[DEBUG] Raw Benchmark (FMP) Data:")
+           # print(bench.tail(10))   
+            if not bench.empty and not pf.empty:
+                    if len(bench) > len(pf):
+                        bench = bench.iloc[:-1]
+            if not bench.empty and not pf.empty:
+                mask = np.isin(bench.index.date, pf['date'].dt.date.unique())
+                bench = bench[mask]
+
+            #print("\n[DEBUG] Raw Benchmark (FMP) Data:")
+            #print(bench.tail(10))   
+
+            print(f"\n===== {name} =====")
+            if pf.empty or bench.empty:
+                print("No data available for this account/benchmark window.")
+                continue
+
+            display_metrics_table(pf, bench)
+            plot_performance(pf, bench)
+
+        except Exception as e:
+            print(f"[{name}] performance fetch failed: {e}")
 
 if __name__ == "__main__":
     main()
