@@ -209,12 +209,26 @@ class AlpacaManager:
         account = self._get_account(account_name)
 
         # Build order payload
+        # Fractional shares must be DAY orders on Alpaca. If quantity is fractional and TIF is not DAY,
+        # force time_in_force to 'day'.
+        try:
+            is_fractional_qty = abs(order.quantity - round(order.quantity)) > 1e-6
+        except Exception:
+            is_fractional_qty = False
+
+        tif = (order.time_in_force or 'day').lower()
+        if is_fractional_qty and tif != 'day':
+            self.logger.info(
+                f"Fractional order detected for {order.symbol} qty={order.quantity:.6f}; overriding time_in_force '{tif}' -> 'day'"
+            )
+            tif = 'day'
+
         payload = {
             'symbol': order.symbol.upper(),
             'qty': str(order.quantity),
             'side': order.side.lower(),
             'type': order.order_type.lower(),
-            'time_in_force': order.time_in_force.lower(),
+            'time_in_force': tif,
             'extended_hours': order.extended_hours
         }
 
