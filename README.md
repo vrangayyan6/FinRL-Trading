@@ -3,8 +3,7 @@
 </div>
 
 # FinRL Trading Platform v2.0
-![dark_logo_white_background](https://github.com/user-attachments/assets/80fe89bb-fb09-4267-b29a-76030512f8cf)
-
+<img src="https://github.com/user-attachments/assets/80fe89bb-fb09-4267-b29a-76030512f8cf" width="200">
 
 [![Downloads](https://static.pepy.tech/badge/finrl-trading)](https://pepy.tech/project/finrl-trading)
 [![Downloads](https://static.pepy.tech/badge/finrl-trading/week)](https://pepy.tech/project/finrl-trading)
