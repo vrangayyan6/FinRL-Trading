@@ -4,6 +4,18 @@
 
 # FinRL Trading Platform v2.0
 
+[![Downloads](https://static.pepy.tech/badge/finrl-trading)](https://pepy.tech/project/finrl-trading)
+[![Downloads](https://static.pepy.tech/badge/finrl-trading/week)](https://pepy.tech/project/finrl-trading)
+[![Join Discord](https://img.shields.io/badge/Discord-Join-blue)](https://discord.gg/trsr8SXpW5)
+[![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org/downloads/)
+[![PyPI](https://img.shields.io/pypi/v/finrl-trading.svg)](https://pypi.org/project/finrl-trading/)
+![License](https://img.shields.io/github/license/AI4Finance-Foundation/FinRL-Trading.svg?color=brightgreen)
+![](https://img.shields.io/github/issues-raw/AI4Finance-Foundation/FinRL-Trading?label=Issues)
+![](https://img.shields.io/github/issues-closed-raw/AI4Finance-Foundation/FinRL-Trading?label=Closed+Issues)
+![](https://img.shields.io/github/issues-pr-raw/AI4Finance-Foundation/FinRL-Trading?label=Open+PRs)
+![](https://img.shields.io/github/issues-pr-closed-raw/AI4Finance-Foundation/FinRL-Trading?label=Closed+PRs)
+
+
 ![Visitors](https://api.visitorbadge.io/api/VisitorHit?user=AI4Finance-Foundation&repo=FinRL-Trading&countColor=%23B17A)
 
 **A modern, modular quantitative trading platform built with Python, featuring machine learning strategies, professional backtesting, and live trading capabilities.**
