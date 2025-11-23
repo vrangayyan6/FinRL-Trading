@@ -23,7 +23,7 @@ def read_requirements():
     return requirements
 
 setup(
-    name="finrl-trading",
+    name="finrl_trading",
     version="2.0.1",
     author="FinRL LLC",
     author_email="contact@finrl.ai",
