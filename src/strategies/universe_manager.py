@@ -2,16 +2,17 @@ import pandas_market_calendars as mcal
 import pandas as pd
 import random 
 import numpy as np
-from strategies.strategylogger import StrategyLogger
+from src.strategies.strategylogger import StrategyLogger ,AsyncWriterThread
+import pandas as pd
 
 class UniverseManager:
     """
     UniverseManager (Final Version, Logger-compatible)
     --------------------------------------------------
-    * 自动从季度选股生成日度股票池
-    * 不关心持仓
-    * 只负责 in_universe 的判断
-    * 事件日志兼容增强版 StrategyLogger
+    * automatically generate daily universe from quarterly stock selection
+    * does not care about positions
+    * only responsible for in_universe judgment
+    * event log compatible enhanced version StrategyLogger
     """
 
     def __init__(
@@ -47,15 +48,10 @@ class UniverseManager:
         if self.backtest_end is not None:
             df = df[df["trade_date"] <= self.backtest_end]
 
-
-        # -----------------------------
         # build daily universe_df
-        # -----------------------------
         self.universe_df = self._build_universe(df)
 
-        # -----------------------------
         # build fast index
-        # -----------------------------
         self.universe_map = self._build_fast_index(self.universe_df)
 
         # save yesterday's universe, for IN / OUT judgment
@@ -94,10 +90,16 @@ class UniverseManager:
         for i in range(len(activate_dates)-1):
             deactivate_map[activate_dates[i]] = activate_dates[i+1]
 
-        max_date = self.trading_calendar.max() + pd.Timedelta(days=1)
+        #max_date = self.trading_calendar.max() + pd.Timedelta(days=1)
+        if self.backtest_end is not None:
+             # backtest_end + 1 month (approx 30 days)
+            max_date = self.backtest_end + pd.Timedelta(days=30)
+        else:
+             # if None, use today
+            max_date = pd.Timestamp.now().normalize()
         deactivate_map[activate_dates[-1]] = max_date
 
-        # ⬇ build daily universe
+        #  build daily universe
         records = []
 
         for trade_date, group in quarters:
@@ -182,3 +184,4 @@ class UniverseManager:
         # --- end of modification ---
 
         self.prev_universe = today_u.copy()
+

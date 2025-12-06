@@ -210,3 +210,24 @@ class StrategyLogger:
         if self.async_mode:
             self.writer_thread.stop()
 
+    def log_info(self, msg, extra=None):
+        """
+        Info 日志（用于 debug 初始化 / 参数）
+        """
+        log_dict = {"msg": msg}
+        if extra is not None:
+            log_dict["extra"] = extra
+        self._push_log(log_dict, category="info")
+
+    def log_event(self, date, symbol, event_type, extra=None):
+        """
+        策略事件日志，例如 BUY / EXIT / STOP_LOSS 等
+        """
+        log_dict = {
+            "date": pd.Timestamp(date),
+            "symbol": symbol,
+            "event": event_type
+        }
+        if extra is not None:
+            log_dict.update(extra)
+        self._push_log(log_dict, category="event")

@@ -1,15 +1,16 @@
 import os
 import pandas as pd
 from typing import Dict, Optional, Iterable
-from strategies.strategylogger import StrategyLogger
-from strategies.base_signal import BaseSignalEngine
+from src.strategies.strategylogger import StrategyLogger ,AsyncWriterThread
+from src.strategies.base_signal import BaseSignalEngine
+
 class TSMOMSignalEngine(BaseSignalEngine):
     """
-    TS-MOM (Moskowitz et al., 2012)
+    TS-MOM (Moskowitz )
     --------------------------------
-    严格使用“月度价格”计算信号：
+    strictly use monthly prices to calculate signals:
         ret_12m = P(t-1m) / P(t-12m) - 1
-    信号是月度频率（M），最终会在 BaseSignalEngine 中扩展成 daily。
+    signal is monthly frequency (M), which will be expanded to daily in BaseSignalEngine.
     """
 
     def __init__(
@@ -20,15 +21,14 @@ class TSMOMSignalEngine(BaseSignalEngine):
         logger=None,
         chunk_size=200000,
         multi_file=True,
-        lookback_months=12,      # lookback 按月
-        neutral_band=0.10,       # 信号区间
-        # === NEW: 信号时间区间 ===
+        lookback_months=12,      # lookback monthly
+        neutral_band=0.10,       # signal range
+        # === signal time interval ===
         signal_start_date=None,
         signal_end_date=None,
         data_start_date=None,
         data_end_date=None
     ):
-        # === FIX: 你原来 super 传参错位置，这里纠正 ===
         super().__init__(
             strategy_name=strategy_name,
             col_map=col_map,
@@ -36,7 +36,7 @@ class TSMOMSignalEngine(BaseSignalEngine):
             logger=logger,
             chunk_size=chunk_size,
             multi_file=multi_file,
-            # === NEW: 信号时间区间传入基类 ===
+            # === pass signal time interval to base class ===
             signal_start_date=signal_start_date,
             signal_end_date=signal_end_date,
             data_start_date=data_start_date,
@@ -46,7 +46,7 @@ class TSMOMSignalEngine(BaseSignalEngine):
         self.lookback_months = lookback_months
         self.neutral_band = neutral_band
 
-        # === NEW: data_end_date 默认等于 signal_end_date ===
+        # === default data_end_date equals signal_end_date ===
         if self.data_end_date is None:
             self.data_end_date = self.signal_end_date
 
@@ -59,17 +59,17 @@ class TSMOMSignalEngine(BaseSignalEngine):
             )
 
     # =====================================================
-    # === NEW: 告诉 BaseSignalEngine 我是月度频率 (M) ===
+    # === BaseSignalEngine  monthly frequency (M) ===
     # =====================================================
     def get_signal_frequency(self):
         return "M"
 
     # =====================================================
-    # 单股票的月度信号生成
+    # generate monthly signal for single stock
     # =====================================================
     def generate_signal_one_ticker(self, df):
 
-        # === NEW: 数据时间过滤 (data_start / data_end) ===
+        # === time filter ===
         if self.data_start_date is not None:
             df = df[df["date"] >= self.data_start_date]
         if self.data_end_date is not None:
@@ -77,33 +77,30 @@ class TSMOMSignalEngine(BaseSignalEngine):
 
         df = df.sort_values("date").copy()
 
-        # ========================
-        # ① 按月取最后一天价格
-        # ========================
+        #  daily return
+        df["ret"] = df["close"].pct_change()
+
+        #  monthly return (last day of the month as index)
         df_m = (
-            df.resample("M", on="date")
-              .last()[["close"]]
-              .dropna()
+            df.resample("M", on="date")["ret"]
+            .apply(lambda x: (x + 1).prod() - 1)
+            .to_frame(name="mret")
+            .dropna()
         )
 
-        # ========================
-        # ② 计算 12 个月动量
-        # ========================
+        #  12 months cumulative return - include the last complete month, not the current incomplete month
         df_m["ret_12m"] = (
-            df_m["close"].shift(1) / df_m["close"].shift(self.lookback_months) - 1
+            df_m["mret"]
+            .rolling(self.lookback_months)
+            .apply(lambda x: (x + 1).prod() - 1, raw=False)
         )
 
-        # ========================
-        # ③ 生成月度信号
-        # ========================
+        #  signal (keep your original logic)
         sig = pd.Series(0, index=df_m.index)
-
         sig[df_m["ret_12m"] > +self.neutral_band] = 1
         sig[df_m["ret_12m"] < -self.neutral_band] = -1
 
-        sig.index.name = "date"
-
-        # === NEW: 信号窗口过滤 ===
+        #  signal window
         if self.signal_start_date is not None:
             sig = sig[sig.index >= self.signal_start_date]
         if self.signal_end_date is not None:

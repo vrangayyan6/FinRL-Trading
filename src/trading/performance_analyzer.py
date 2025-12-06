@@ -4,6 +4,7 @@
 # 2. updated to add run_multi_account_performance : 
 # loop accounts and print metrics/plot per account using existing functions.
 # Returns a dict of {account_name: portfolio_df} for further analysis.
+# 3. correct the date alignment issue by normalizing the date to midnight and removing the timezone. -11-22
 import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta, timezone
@@ -166,11 +167,13 @@ def display_metrics_table(portfolio_df: pd.DataFrame, benchmark_df: pd.DataFrame
 
     # Prepare aligned DataFrame on common dates with no NaNs across selected columns
     ps = portfolio_df[['date', 'equity']].copy()
-    ps['date'] = pd.to_datetime(ps['date'])
+    # Convert to datetime, normalize to midnight, and remove timezone for alignment
+    ps['date'] = pd.to_datetime(ps['date']).dt.normalize().dt.tz_localize(None)
     ps = ps.set_index('date').sort_index().rename(columns={'equity': 'Portfolio'})
 
     bs = benchmark_df.copy()
-    bs.index = pd.to_datetime(bs.index)
+    # Ensure benchmark index is also normalized and timezone-naive
+    bs.index = pd.to_datetime(bs.index).normalize().tz_localize(None)
     present_benchmarks = [c for c in ['SPY', 'QQQ'] if c in bs.columns]
     if not present_benchmarks:
         print("No benchmark columns (SPY/QQQ) available for metrics table.")
@@ -272,11 +275,13 @@ def plot_performance(portfolio_df: pd.DataFrame, benchmark_df: pd.DataFrame):
 
     # Align on common dates with no NaNs across present columns
     ps = portfolio_df[['date', 'equity']].copy()
-    ps['date'] = pd.to_datetime(ps['date'])
+    # Convert to datetime, normalize to midnight, and remove timezone for alignment
+    ps['date'] = pd.to_datetime(ps['date']).dt.normalize().dt.tz_localize(None)
     ps = ps.set_index('date').sort_index().rename(columns={'equity': 'Portfolio'})
 
     bs = benchmark_df.copy()
-    bs.index = pd.to_datetime(bs.index)
+    # Ensure benchmark index is also normalized and timezone-naive
+    bs.index = pd.to_datetime(bs.index).normalize().tz_localize(None)
     present_benchmarks = [c for c in ['SPY', 'QQQ'] if c in bs.columns]
     if not present_benchmarks:
         print("No benchmark columns (SPY/QQQ) available for plotting.")
@@ -459,6 +464,10 @@ def main():
                     if len(bench) > len(pf):
                         bench = bench.iloc[:-1]
             if not bench.empty and not pf.empty:
+                # DEBUG: Check dates before filtering
+                print(f"[DEBUG] PF dates tail: {pf['date'].dt.date.unique()[-5:]}")
+                print(f"[DEBUG] Bench dates tail: {bench.index.date[-5:]}")
+
                 mask = np.isin(bench.index.date, pf['date'].dt.date.unique())
                 bench = bench[mask]
 

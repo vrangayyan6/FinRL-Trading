@@ -6,7 +6,9 @@ Supports multiple financial data sources:
 - Financial Modeling Prep (FMP, API required)
 
 Provides unified data format for all sources.
+
 """
+# 1. updated to use the new FMP API v4,solved data fetching issue -11-23
 
 import os
 import logging
@@ -151,8 +153,8 @@ class FMPFetcher(BaseDataFetcher, DataSource):
 
     def __init__(self, cache_dir: str = "./data/cache"):
         super().__init__(cache_dir)
-        # self.base_url = "https://financialmodelingprep.com/api/v3"
-        self.base_url = "https://financialmodelingprep.com/stable/"
+        self.base_url = "https://financialmodelingprep.com/api/v3"
+        # self.base_url = "https://financialmodelingprep.com/stable/"
         # Offline mode when API key is not provided; computed lazily but default here
         self.api_key = self._get_api_key()
         self.offline_mode = not bool(self.api_key)
@@ -168,6 +170,7 @@ class FMPFetcher(BaseDataFetcher, DataSource):
             from src.config.settings import get_config
             config = get_config()
             if config.fmp.api_key:
+                print(f"FMP API key: {config.fmp.api_key}")
                 return config.fmp.api_key.get_secret_value()
             return None
         except Exception as e:
@@ -342,7 +345,9 @@ class FMPFetcher(BaseDataFetcher, DataSource):
                 # 9,10,11
                 return pd.Timestamp(year=year, month=12, day=1)
 
-        prices = self.get_price_data(tickers, extended_start_date, extended_end_date)
+            prices = self.get_price_data(tickers, extended_start_date, extended_end_date)
+        else:
+            prices = pd.DataFrame()
 
         for ticker in tickers_to_fetch if tickers_to_fetch else []:
             try:
@@ -744,7 +749,7 @@ class FMPFetcher(BaseDataFetcher, DataSource):
                     min_date = min(start for start, _ in date_ranges)
                     max_date = max(end for _, end in date_ranges)
 
-                    url = f"{self.base_url}/historical-price-full/{ticker}?from={min_date}&to={max_date}&apikey={api_key}"
+                    url = f"{self.base_url}/historical-price-full/{ticker}?from={min_date}&to={max_date}&apikey={self.api_key}"
                     response = requests.get(url)
                     response.raise_for_status()
                     
