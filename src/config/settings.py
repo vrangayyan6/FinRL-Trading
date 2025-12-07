@@ -59,6 +59,16 @@ class FMPSettings(BaseSettings):
         env_prefix = "FMP_"
 
 
+class OpenAISettings(BaseSettings):
+    """OpenAI GPT configuration settings."""
+    api_key: Optional[SecretStr] = None
+    model: str = "gpt-4o-mini"
+    request_timeout: int = 30
+
+    class Config:
+        env_prefix = "OPENAI_"
+
+
 class DataSettings(BaseSettings):
     """
     Data management configuration settings.
@@ -148,6 +158,7 @@ class FinRLSettings(BaseSettings):
     alpaca: AlpacaSettings = AlpacaSettings()
     wrds: WRDSSettings = WRDSSettings()
     fmp: FMPSettings = FMPSettings()
+    openai: OpenAISettings = OpenAISettings()
     data: DataSettings = DataSettings()
     strategy: StrategySettings = StrategySettings()
     trading: TradingSettings = TradingSettings()
@@ -256,6 +267,11 @@ WRDS_DATABASE=wrds
 
 # Financial Modeling Prep API Settings
 FMP_API_KEY=your_fmp_api_key_here
+
+# OpenAI GPT Settings
+OPENAI_API_KEY=your_openai_api_key_here
+OPENAI_MODEL=gpt-4o-mini
+OPENAI_REQUEST_TIMEOUT=30
 
 # Data Management Settings
 # DATA_BASE_DIR: Directory where the SQLite database and all data files are stored

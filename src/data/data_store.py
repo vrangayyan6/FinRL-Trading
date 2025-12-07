@@ -119,6 +119,42 @@ class DataStore:
                 )
             ''')
 
+            # Create news articles table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS news_articles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT NOT NULL,
+                    published_datetime TEXT NOT NULL,
+                    published_date TEXT NOT NULL,
+                    publisher TEXT,
+                    title TEXT,
+                    site TEXT,
+                    image TEXT,
+                    body TEXT,
+                    url TEXT,
+                    raw_json TEXT,
+                    sentiment TEXT,
+                    sentiment_confidence REAL,
+                    sentiment_model TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(ticker, published_datetime, title)
+                )
+            ''')
+
+            # Track requested news ranges to avoid repeated API calls
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS news_fetch_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT NOT NULL,
+                    start_date TEXT NOT NULL,
+                    end_date TEXT NOT NULL,
+                    record_count INTEGER DEFAULT 0,
+                    fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(ticker, start_date, end_date)
+                )
+            ''')
+
 
             conn.commit()
             logger.info(f"Initialized database at {self.db_path}")
@@ -247,6 +283,184 @@ class DataStore:
             df['gvkey'] = df['tic']
             
         return df
+
+    # =========================
+    # News helpers
+    # =========================
+
+    def save_news_articles(self, ticker: str, articles: List[Dict[str, Any]]) -> int:
+        """Persist news articles."""
+        if not ticker or not articles:
+            return 0
+
+        rows = []
+        for article in articles:
+            symbol = article.get('symbol') or ticker
+            published_raw = article.get('publishedDate') or article.get('published_datetime') or article.get('date')
+            published_ts = pd.to_datetime(published_raw, errors='coerce')
+            if pd.isna(published_ts):
+                published_ts = pd.Timestamp.utcnow()
+            published_datetime = published_ts.strftime('%Y-%m-%d %H:%M:%S')
+            published_date = published_ts.strftime('%Y-%m-%d')
+            body = article.get('text') or article.get('body') or ''
+
+            rows.append((
+                symbol,
+                published_datetime,
+                published_date,
+                article.get('publisher'),
+                article.get('title'),
+                article.get('site'),
+                article.get('image'),
+                body,
+                article.get('url'),
+                json.dumps(article, ensure_ascii=False),
+                article.get('sentiment'),
+                article.get('sentiment_confidence'),
+                article.get('sentiment_model')
+            ))
+
+        if not rows:
+            return 0
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.executemany('''
+                INSERT OR REPLACE INTO news_articles
+                (ticker, published_datetime, published_date, publisher, title, site, image, body, url, raw_json,
+                 sentiment, sentiment_confidence, sentiment_model, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ''', rows)
+            conn.commit()
+
+        logger.info(f"Saved {len(rows)} news articles for {ticker}")
+        return len(rows)
+
+    def get_news_articles(self, ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """Load cached news articles."""
+        if not ticker:
+            return pd.DataFrame()
+
+        with sqlite3.connect(self.db_path) as conn:
+            df = pd.read_sql_query('''
+                SELECT ticker, published_datetime, published_date, publisher, title, site, image, body, url,
+                       sentiment, sentiment_confidence, sentiment_model
+                FROM news_articles
+                WHERE ticker = ?
+                  AND published_date >= ?
+                  AND published_date <= ?
+                ORDER BY published_datetime DESC
+            ''', conn, params=(ticker, start_date, end_date))
+
+        return df
+
+    def save_news_fetch_range(self, ticker: str, start_date: str, end_date: str, record_count: int) -> None:
+        """Store fetched date ranges for news."""
+        if not ticker or not start_date or not end_date:
+            return
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO news_fetch_log (ticker, start_date, end_date, record_count, fetched_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (ticker, start_date, end_date, int(record_count)))
+            conn.commit()
+
+    def get_missing_news_ranges(self, ticker: str, start_date: str, end_date: str) -> List[Tuple[str, str]]:
+        """Identify which sub ranges of [start_date, end_date] have not been fetched yet."""
+        if not ticker:
+            return [(start_date, end_date)]
+
+        req_start = pd.to_datetime(start_date)
+        req_end = pd.to_datetime(end_date)
+        if req_start > req_end:
+            return []
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT start_date, end_date
+                FROM news_fetch_log
+                WHERE ticker = ?
+                  AND NOT (end_date < ? OR start_date > ?)
+                ORDER BY start_date
+            ''', (ticker, start_date, end_date))
+            rows = cursor.fetchall()
+
+        existing_ranges: List[Tuple[pd.Timestamp, pd.Timestamp]] = []
+        for row in rows:
+            start_ts = pd.to_datetime(row[0])
+            end_ts = pd.to_datetime(row[1])
+            if pd.isna(start_ts) or pd.isna(end_ts):
+                continue
+            existing_ranges.append((start_ts, end_ts))
+
+        merged_ranges = self._merge_date_ranges(existing_ranges)
+
+        missing: List[Tuple[str, str]] = []
+        pointer = req_start
+        for start_ts, end_ts in merged_ranges:
+            if end_ts < req_start:
+                continue
+            if start_ts > req_end:
+                break
+
+            cover_start = max(start_ts, req_start)
+            cover_end = min(end_ts, req_end)
+
+            if cover_start > pointer:
+                gap_end = cover_start - pd.Timedelta(days=1)
+                if gap_end >= pointer:
+                    missing.append((pointer.strftime('%Y-%m-%d'), gap_end.strftime('%Y-%m-%d')))
+
+            pointer = max(pointer, cover_end + pd.Timedelta(days=1))
+
+        if pointer <= req_end:
+            missing.append((pointer.strftime('%Y-%m-%d'), req_end.strftime('%Y-%m-%d')))
+
+        return [rng for rng in missing if pd.to_datetime(rng[0]) <= pd.to_datetime(rng[1])]
+
+    def update_news_sentiment(self, ticker: str, published_datetime: str,
+                              sentiment: Optional[str], sentiment_confidence: Optional[float],
+                              sentiment_model: Optional[str]) -> None:
+        """Update sentiment fields for an existing news record."""
+        if not ticker or not published_datetime:
+            return
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE news_articles
+                   SET sentiment = ?,
+                       sentiment_confidence = ?,
+                       sentiment_model = ?,
+                       updated_at = CURRENT_TIMESTAMP
+                 WHERE ticker = ? AND published_datetime = ?
+            ''', (sentiment, sentiment_confidence, sentiment_model, ticker, published_datetime))
+            conn.commit()
+
+    @staticmethod
+    def _merge_date_ranges(ranges: List[Tuple[pd.Timestamp, pd.Timestamp]]) -> List[Tuple[pd.Timestamp, pd.Timestamp]]:
+        """Merge overlapping or adjacent date ranges."""
+        if not ranges:
+            return []
+
+        sorted_ranges = sorted(ranges, key=lambda item: item[0])
+        merged: List[Tuple[pd.Timestamp, pd.Timestamp]] = []
+
+        for start_ts, end_ts in sorted_ranges:
+            if not merged:
+                merged.append((start_ts, end_ts))
+                continue
+
+            last_start, last_end = merged[-1]
+            if start_ts <= last_end + pd.Timedelta(days=1):
+                merged[-1] = (last_start, max(last_end, end_ts))
+            else:
+                merged.append((start_ts, end_ts))
+
+        return merged
 
     def get_missing_price_dates(self, ticker: str, start_date: str, end_date: str, exchange: str = 'NYSE') -> List[Tuple[str, str]]:
         """

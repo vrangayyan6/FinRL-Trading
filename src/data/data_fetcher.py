@@ -10,7 +10,8 @@ Provides unified data format for all sources.
 
 import os
 import logging
-from typing import List, Optional, Dict, Any, Protocol
+import json
+from typing import List, Optional, Dict, Any, Protocol, Tuple
 from datetime import datetime
 from abc import ABC
 import pandas as pd
@@ -52,6 +53,13 @@ class DataSource(Protocol):
 
     def is_available(self) -> bool:
         """Check if data source is available."""
+        ...
+
+    def get_news(self, ticker: str, from_date: str, to_date: str,
+                 analyze_sentiment: bool = False,
+                 sentiment_model: Optional[str] = None,
+                 force_refresh: bool = False) -> pd.DataFrame:
+        """Get news articles for a ticker."""
         ...
 
 
@@ -156,6 +164,11 @@ class FMPFetcher(BaseDataFetcher, DataSource):
         # Offline mode when API key is not provided; computed lazily but default here
         self.api_key = self._get_api_key()
         self.offline_mode = not bool(self.api_key)
+        self._openai_client = None
+        self._openai_api_key: Optional[str] = None
+        self._sentiment_model: Optional[str] = None
+        self._sentiment_request_timeout: int = 30
+        self._init_sentiment_settings()
 
     def is_available(self) -> bool:
         """Check if data source is usable (online or offline)."""
@@ -173,6 +186,42 @@ class FMPFetcher(BaseDataFetcher, DataSource):
         except Exception as e:
             logger.error(f"Failed to get FMP API key: {e}")
             return None
+
+    def _init_sentiment_settings(self) -> None:
+        """Load GPT sentiment analysis configuration."""
+        try:
+            from src.config.settings import get_config
+            config = get_config()
+            openai_cfg = getattr(config, 'openai', None)
+            if openai_cfg and openai_cfg.api_key:
+                self._openai_api_key = openai_cfg.api_key.get_secret_value()
+                self._sentiment_model = openai_cfg.model
+                self._sentiment_request_timeout = getattr(openai_cfg, 'request_timeout', 30) or 30
+            else:
+                self._openai_api_key = None
+                self._sentiment_model = None
+        except Exception as exc:
+            logger.debug(f"Failed to initialize OpenAI settings: {exc}")
+            self._openai_api_key = None
+            self._sentiment_model = None
+
+    def _get_openai_client(self):
+        """Lazily initialize OpenAI client."""
+        if not self._openai_api_key:
+            return None
+        if self._openai_client is not None:
+            return self._openai_client
+        try:
+            from openai import OpenAI
+        except ImportError:
+            logger.warning("openai package not installed; sentiment analysis unavailable")
+            return None
+        try:
+            self._openai_client = OpenAI(api_key=self._openai_api_key)
+        except Exception as exc:
+            logger.warning(f"Failed to initialize OpenAI client: {exc}")
+            self._openai_client = None
+        return self._openai_client
 
     def _fetch_fmp_data(self, ticker: str, endpoint: str, period: str,
                         start_date: Optional[str] = None, end_date: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -263,7 +312,7 @@ class FMPFetcher(BaseDataFetcher, DataSource):
             if not self.api_key:
                 raise ValueError("FMP API key not found")
 
-            url = f"{self.base_url}/sp500_constituent?apikey={self.api_key}"
+            url = f"{self.base_url}/sp500-constituent?apikey={self.api_key}"
             response = requests.get(url)
             response.raise_for_status()
 
@@ -297,6 +346,199 @@ class FMPFetcher(BaseDataFetcher, DataSource):
             if latest:
                 return pd.DataFrame({'tickers': latest.split(","), 'sectors': latest_sectors.split(","), 'dateFirstAdded': latest_dateFirstAdded.split(",")})
             return pd.DataFrame({'tickers': [], 'sectors': [], 'dateFirstAdded': []})
+
+    def _parse_sentiment_response(self, content: str) -> Dict[str, Any]:
+        """Parse GPT response into sentiment payload."""
+        if not content:
+            return {}
+        try:
+            parsed = json.loads(content)
+            if isinstance(parsed, dict):
+                sentiment = str(parsed.get('sentiment') or parsed.get('label') or '').lower()
+                if sentiment in {'positive', 'neutral', 'negative'}:
+                    confidence = parsed.get('confidence') or parsed.get('score')
+                    try:
+                        confidence_val = float(confidence) if confidence is not None else None
+                    except (TypeError, ValueError):
+                        confidence_val = None
+                    return {'sentiment': sentiment, 'confidence': confidence_val}
+        except json.JSONDecodeError:
+            pass
+
+        lowered = content.strip().lower()
+        for sentiment in ('positive', 'neutral', 'negative'):
+            if sentiment in lowered:
+                return {'sentiment': sentiment, 'confidence': None}
+        return {}
+
+    def _annotate_sentiment(self, articles: List[Dict[str, Any]], sentiment_model: Optional[str] = None) -> None:
+        """Call GPT API to annotate sentiment for a batch of news articles."""
+        if not articles:
+            return
+
+        client = self._get_openai_client()
+        if not client:
+            logger.info("OpenAI client unavailable, skip sentiment analysis")
+            return
+
+        model = sentiment_model or self._sentiment_model
+        if not model:
+            logger.info("Sentiment model not configured, skip sentiment analysis")
+            return
+
+        for article in articles:
+            title = (article.get('title') or '').strip()
+            body = (article.get('text') or article.get('body') or '').strip()
+            if not title and not body:
+                continue
+            if len(body) > 1500:
+                body = body[:1500]
+
+            prompt = (
+                "请阅读以下新闻并判断整体情绪是 positive、neutral 还是 negative。"
+                " 仅返回 JSON，如 {\"sentiment\": \"neutral\", \"confidence\": 0.65}。"
+                f"\n标题: {title}\n内容: {body}"
+            )
+
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": "你是一名金融新闻情绪分析助手，只输出JSON。"},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.1,
+                    max_tokens=60
+                )
+                message = response.choices[0].message.content.strip()
+                parsed = self._parse_sentiment_response(message)
+                if parsed.get('sentiment'):
+                    article['sentiment'] = parsed['sentiment']
+                    article['sentiment_confidence'] = parsed.get('confidence')
+                    article['sentiment_model'] = model
+            except Exception as exc:
+                logger.debug(f"Sentiment analysis failed for news '{title}': {exc}")
+
+    def _ensure_news_sentiment(
+        self,
+        ticker: str,
+        start_date: str,
+        end_date: str,
+        df: pd.DataFrame,
+        sentiment_model: Optional[str] = None
+    ) -> pd.DataFrame:
+        """Ensure cached rows also have sentiment when requested."""
+        if df.empty or 'sentiment' not in df.columns:
+            return df
+
+        mask_missing = df['sentiment'].isna() | (df['sentiment'].astype(str).str.strip() == '')
+        if not mask_missing.any():
+            return df
+
+        articles = df[mask_missing].to_dict('records')
+        self._annotate_sentiment(articles, sentiment_model)
+
+        updated = False
+        for article in articles:
+            sentiment = article.get('sentiment')
+            if sentiment:
+                self.data_store.update_news_sentiment(
+                    ticker,
+                    article.get('published_datetime'),
+                    sentiment,
+                    article.get('sentiment_confidence'),
+                    article.get('sentiment_model') or sentiment_model or self._sentiment_model
+                )
+                updated = True
+
+        if updated:
+            return self.data_store.get_news_articles(ticker, start_date, end_date)
+        return df
+
+    def get_news(
+        self,
+        ticker: str,
+        from_date: str,
+        to_date: str,
+        analyze_sentiment: bool = False,
+        sentiment_model: Optional[str] = None,
+        force_refresh: bool = False
+    ) -> pd.DataFrame:
+        """Get news from FMP with local caching and optional GPT sentiment analysis."""
+        if not ticker:
+            raise ValueError("ticker is required for get_news")
+
+        try:
+            start_date = pd.to_datetime(from_date).strftime('%Y-%m-%d')
+            end_date = pd.to_datetime(to_date).strftime('%Y-%m-%d')
+        except Exception as exc:
+            raise ValueError(f"Invalid from/to date: {exc}") from exc
+
+        if pd.to_datetime(start_date) > pd.to_datetime(end_date):
+            raise ValueError("from_date must be earlier than to_date")
+
+        cached = self.data_store.get_news_articles(ticker, start_date, end_date)
+        logger.info(f"Loaded {len(cached)} cached news rows for {ticker} ({start_date} -> {end_date})")
+
+        if self.offline_mode or not self.api_key:
+            logger.info("Offline or missing API key: returning cached news only")
+            if analyze_sentiment:
+                cached = self._ensure_news_sentiment(ticker, start_date, end_date, cached, sentiment_model)
+            return cached
+
+        missing_ranges = (
+            [(start_date, end_date)]
+            if force_refresh
+            else self.data_store.get_missing_news_ranges(ticker, start_date, end_date)
+        )
+
+        new_articles: List[Dict[str, Any]] = []
+        completed_ranges: List[Tuple[str, str, int]] = []
+        if missing_ranges:
+            for range_start, range_end in missing_ranges:
+                url = (
+                    f"{self.base_url}/news/stock?"
+                    f"symbols={ticker}&from={range_start}&to={range_end}&apikey={self.api_key}"
+                )
+                try:
+                    response = requests.get(url, timeout=30)
+                    response.raise_for_status()
+                    payload = response.json()
+                    if isinstance(payload, dict) and 'news' in payload:
+                        news_items = payload['news']
+                    elif isinstance(payload, list):
+                        news_items = payload
+                    else:
+                        news_items = []
+
+                    logger.info(f"Fetched {len(news_items)} news entries for {ticker} ({range_start}->{range_end})")
+
+                    for item in news_items:
+                        item.setdefault('symbol', ticker)
+                        if not item.get('publishedDate'):
+                            item['publishedDate'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+
+                    new_articles.extend(news_items)
+                    completed_ranges.append((range_start, range_end, len(news_items)))
+                except requests.RequestException as exc:
+                    logger.warning(f"Failed to fetch news for {ticker} ({range_start}->{range_end}): {exc}")
+        else:
+            logger.info(f"News cache already covers requested range for {ticker}")
+
+        if new_articles:
+            if analyze_sentiment:
+                self._annotate_sentiment(new_articles, sentiment_model)
+            self.data_store.save_news_articles(ticker, new_articles)
+
+        if completed_ranges:
+            for range_start, range_end, count in completed_ranges:
+                self.data_store.save_news_fetch_range(ticker, range_start, range_end, count)
+
+        result = self.data_store.get_news_articles(ticker, start_date, end_date)
+        if analyze_sentiment:
+            result = self._ensure_news_sentiment(ticker, start_date, end_date, result, sentiment_model)
+
+        return result
 
     def get_fundamental_data(self, tickers: pd.DataFrame, start_date: str, end_date: str, align_quarter_dates: bool = False) -> pd.DataFrame:
         """Get fundamental data from FMP with extended fields and forward y_return and incremental updates.
@@ -744,7 +986,7 @@ class FMPFetcher(BaseDataFetcher, DataSource):
                     min_date = min(start for start, _ in date_ranges)
                     max_date = max(end for _, end in date_ranges)
 
-                    url = f"{self.base_url}/historical-price-full/{ticker}?from={min_date}&to={max_date}&apikey={api_key}"
+                    url = f"{self.base_url}/historical-price-eod/full?symbol={ticker}?from={min_date}&to={max_date}&apikey={self.api_key}"
                     response = requests.get(url)
                     response.raise_for_status()
                     
@@ -854,6 +1096,23 @@ class DataSourceManager:
                       start_date: str, end_date: str) -> pd.DataFrame:
         """Get price data using best available source."""
         return self.current_source.get_price_data(tickers, start_date, end_date)
+
+    def get_news(self, ticker: str, from_date: str, to_date: str,
+                 analyze_sentiment: bool = False,
+                 sentiment_model: Optional[str] = None,
+                 force_refresh: bool = False) -> pd.DataFrame:
+        """Get news data using best available source."""
+        fetcher = getattr(self.current_source, 'get_news', None)
+        if not callable(fetcher):
+            raise NotImplementedError(f"{self.current_source_name} does not support news retrieval")
+        return fetcher(
+            ticker,
+            from_date,
+            to_date,
+            analyze_sentiment=analyze_sentiment,
+            sentiment_model=sentiment_model,
+            force_refresh=force_refresh
+        )
 
     def get_source_info(self) -> Dict[str, Any]:
         """Get information about current data source."""
@@ -969,6 +1228,37 @@ def fetch_price_data(tickers: List[str] | pd.DataFrame, start_date: str, end_dat
     return df
 
 
+def fetch_news(ticker: str, start_date: str, end_date: str,
+               analyze_sentiment: bool = False,
+               sentiment_model: Optional[str] = None,
+               force_refresh: bool = False,
+               preferred_source='FMP') -> pd.DataFrame:
+    """
+    Fetch news for a ticker with optional GPT情绪分析.
+
+    Args:
+        ticker: 股票代码
+        start_date: 起始日期 (YYYY-MM-DD)
+        end_date: 结束日期 (YYYY-MM-DD)
+        analyze_sentiment: 是否调用 GPT 进行情绪分析
+        sentiment_model: 覆盖默认 GPT 模型
+        force_refresh: 是否忽略缓存强制重新抓取
+        preferred_source: 指定数据源
+
+    Returns:
+        DataFrame of news articles with sentiment metadata.
+    """
+    manager = get_data_manager(preferred_source=preferred_source)
+    return manager.get_news(
+        ticker,
+        start_date,
+        end_date,
+        analyze_sentiment=analyze_sentiment,
+        sentiment_model=sentiment_model,
+        force_refresh=force_refresh
+    )
+
+
 if __name__ == "__main__":
     # Test the data source manager
     logging.basicConfig(level=logging.INFO)
@@ -988,11 +1278,11 @@ if __name__ == "__main__":
 
     # Fetch sample data
     # end_date = datetime.now().strftime('%Y-%m-%d')
-    fundamentals = fetch_fundamental_data(
-        components, "2015-10-15", "2025-10-15", align_quarter_dates=True
-    )
-    print(f"Fetched {len(fundamentals)} fundamental records")
-    fundamentals.to_csv("./data/fundamentals.csv", index=False)
+    # fundamentals = fetch_fundamental_data(
+    #     components, "2015-10-15", "2025-10-15", align_quarter_dates=True
+    # )
+    # print(f"Fetched {len(fundamentals)} fundamental records")
+    # fundamentals.to_csv("./data/fundamentals.csv", index=False)
 
     # # Fetch sample data
     # fundamentals = fetch_fundamental_data(
@@ -1010,3 +1300,17 @@ if __name__ == "__main__":
     #     tickers[:5], "2022-01-01", "2025-12-31"
     # )
     # print(f"Fetched {len(prices)} price records")
+
+    # Fetch news sample with情绪分析（需配置 FMP & OpenAI API Key）
+    news_df = fetch_news(
+        ticker="NVDA",
+        start_date="2025-01-01",
+        end_date="2025-01-03",
+        analyze_sentiment=True
+    )
+    print(f"Fetched {len(news_df)} cached+fresh news rows")
+    news_df.to_csv("./data/news_nvda.csv", index=False)
+    if not news_df.empty:
+        preview_cols = ['published_date', 'publisher', 'title', 'sentiment']
+        available_cols = [col for col in preview_cols if col in news_df.columns]
+        print(news_df[available_cols].head())
