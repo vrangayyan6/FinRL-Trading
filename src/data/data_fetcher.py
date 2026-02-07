@@ -4,6 +4,7 @@ Unified Data Source Module
 
 Supports multiple financial data sources:
 - Financial Modeling Prep (FMP, API required)
+- Yahoo Finance (no API key required)
 
 Provides unified data format for all sources.
 """
@@ -1036,6 +1037,411 @@ class FMPFetcher(BaseDataFetcher, DataSource):
         return final_data
 
 
+class YahooFinanceFetcher(BaseDataFetcher, DataSource):
+    """Yahoo Finance data fetcher using yfinance library."""
+
+    def __init__(self, cache_dir: str = "./data/cache"):
+        super().__init__(cache_dir)
+        self._session = None
+
+    def is_available(self) -> bool:
+        """Check if Yahoo Finance is available (always True since no API key needed)."""
+        return True
+
+    def get_sp500_components(self, date: str = None) -> pd.DataFrame:
+        """Get S&P 500 components from Wikipedia."""
+        try:
+            # Fetch S&P 500 list from Wikipedia
+            url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+            tables = pd.read_html(url)
+            sp500_table = tables[0]
+
+            # Standardize column names
+            result = pd.DataFrame({
+                'tickers': sp500_table['Symbol'].str.replace('.', '-', regex=False),  # Yahoo uses - instead of .
+                'sectors': sp500_table['GICS Sector'],
+                'dateFirstAdded': sp500_table.get('Date added', pd.NaT)
+            })
+
+            logger.info(f"Fetched {len(result)} S&P 500 components from Wikipedia")
+            return result
+
+        except Exception as e:
+            logger.error(f"Failed to fetch S&P 500 components: {e}")
+            # Return empty DataFrame on failure
+            return pd.DataFrame(columns=['tickers', 'sectors', 'dateFirstAdded'])
+
+    def get_fundamental_data(self, tickers: List[str] | pd.DataFrame,
+                            start_date: str, end_date: str,
+                            align_quarter_dates: bool = False) -> pd.DataFrame:
+        """
+        Get fundamental data from Yahoo Finance.
+
+        Args:
+            tickers: List of ticker symbols or DataFrame with 'tickers' column
+            start_date: Start date (YYYY-MM-DD)
+            end_date: End date (YYYY-MM-DD)
+            align_quarter_dates: If True, align dates to ~2 months after quarter end
+
+        Returns:
+            DataFrame with fundamental data including y_return
+        """
+        # Convert tickers to list if DataFrame
+        if isinstance(tickers, pd.DataFrame):
+            ticker_list = tickers['tickers'].astype(str).tolist()
+        else:
+            ticker_list = list(tickers)
+
+        start_dt = pd.to_datetime(start_date)
+        end_dt = pd.to_datetime(end_date)
+
+        all_records = []
+
+        # Process tickers with progress bar
+        for ticker in tqdm(ticker_list, desc="Fetching Yahoo Finance data"):
+            try:
+                records = self._fetch_ticker_fundamentals(
+                    ticker, start_dt, end_dt, align_quarter_dates
+                )
+                all_records.extend(records)
+            except Exception as e:
+                logger.error(f"Error fetching fundamentals for {ticker}: {e}")
+                continue
+
+        # Create DataFrame
+        df = pd.DataFrame()
+        if all_records:
+            df = pd.DataFrame(all_records)
+            try:
+                df = df.sort_values(['tic', 'datadate'])
+                # Calculate forward return (next quarter)
+                df['y_return'] = df.groupby('tic')['adj_close_q'].transform(
+                    lambda s: np.log(s.shift(-1) / s)
+                )
+                # Filter to requested date range
+                mask_in_range = pd.to_datetime(df['datadate']).between(start_dt, end_dt, inclusive='both')
+                df = df[mask_in_range].reset_index(drop=True)
+            except Exception as e:
+                logger.warning(f"Failed to compute forward y_return: {e}")
+
+        logger.info(f"Returning {len(df)} total fundamental records from Yahoo Finance")
+        return df
+
+    def _fetch_ticker_fundamentals(self, ticker: str, start_dt: pd.Timestamp,
+                                   end_dt: pd.Timestamp, align_quarter_dates: bool) -> List[Dict]:
+        """Fetch fundamental data for a single ticker."""
+        records = []
+
+        try:
+            yf_ticker = yf.Ticker(ticker)
+
+            # Get company info for sector
+            info = yf_ticker.info
+            gsector = info.get('sector', 'Unknown')
+
+            # Get quarterly financials
+            quarterly_income = yf_ticker.quarterly_income_stmt
+            quarterly_balance = yf_ticker.quarterly_balance_sheet
+            quarterly_cashflow = yf_ticker.quarterly_cashflow
+
+            if quarterly_income.empty:
+                logger.debug(f"No quarterly income data for {ticker}")
+                return records
+
+            # Get historical prices for the period
+            price_start = (start_dt - pd.DateOffset(months=6)).strftime('%Y-%m-%d')
+            price_end = (end_dt + pd.DateOffset(months=6)).strftime('%Y-%m-%d')
+            prices = yf_ticker.history(start=price_start, end=price_end, auto_adjust=True)
+
+            if prices.empty:
+                logger.debug(f"No price data for {ticker}")
+                return records
+
+            # Process each quarter
+            for quarter_date in quarterly_income.columns:
+                qd = pd.to_datetime(quarter_date)
+
+                # Skip if outside date range (with buffer for alignment)
+                if qd < start_dt - pd.DateOffset(months=3) or qd > end_dt + pd.DateOffset(months=3):
+                    continue
+
+                # Calculate aligned date (approximately 2 months after quarter end)
+                if align_quarter_dates:
+                    aligned_date = qd + pd.DateOffset(months=2)
+                else:
+                    aligned_date = qd
+
+                # Extract income statement data
+                income_data = quarterly_income[quarter_date].to_dict() if quarter_date in quarterly_income.columns else {}
+                balance_data = quarterly_balance[quarter_date].to_dict() if quarter_date in quarterly_balance.columns else {}
+                cashflow_data = quarterly_cashflow[quarter_date].to_dict() if quarter_date in quarterly_cashflow.columns else {}
+
+                # Get price at aligned date
+                adj_close = self._get_price_at_date(prices, aligned_date)
+
+                # Calculate fundamental metrics
+                record = self._calculate_fundamentals(
+                    ticker=ticker,
+                    gsector=gsector,
+                    datadate=aligned_date if align_quarter_dates else qd,
+                    income_data=income_data,
+                    balance_data=balance_data,
+                    cashflow_data=cashflow_data,
+                    adj_close=adj_close,
+                    info=info
+                )
+
+                if record:
+                    records.append(record)
+
+        except Exception as e:
+            logger.debug(f"Error processing {ticker}: {e}")
+
+        return records
+
+    def _get_price_at_date(self, prices: pd.DataFrame, target_date: pd.Timestamp) -> float:
+        """Get the adjusted close price at or near the target date."""
+        try:
+            # Find the closest trading day
+            prices.index = pd.to_datetime(prices.index).tz_localize(None)
+            target_date = pd.to_datetime(target_date).tz_localize(None)
+
+            # Look for price on or after target date (up to 10 days)
+            for days_offset in range(11):
+                search_date = target_date + pd.Timedelta(days=days_offset)
+                if search_date in prices.index:
+                    return float(prices.loc[search_date, 'Close'])
+
+            # Fallback: get the last available price before target date
+            prior_prices = prices[prices.index <= target_date]
+            if not prior_prices.empty:
+                return float(prior_prices.iloc[-1]['Close'])
+
+        except Exception as e:
+            logger.debug(f"Error getting price at {target_date}: {e}")
+
+        return np.nan
+
+    def _calculate_fundamentals(self, ticker: str, gsector: str, datadate: pd.Timestamp,
+                                income_data: Dict, balance_data: Dict, cashflow_data: Dict,
+                                adj_close: float, info: Dict) -> Optional[Dict]:
+        """Calculate fundamental metrics from Yahoo Finance data."""
+        try:
+            # Helper function to safely get numeric value
+            def safe_get(data: Dict, *keys) -> Optional[float]:
+                for key in keys:
+                    val = data.get(key)
+                    if val is not None and pd.notna(val):
+                        try:
+                            return float(val)
+                        except (ValueError, TypeError):
+                            continue
+                return None
+
+            # Income statement metrics
+            net_income = safe_get(income_data, 'Net Income', 'NetIncome', 'Net Income Common Stockholders')
+            revenue = safe_get(income_data, 'Total Revenue', 'TotalRevenue', 'Revenue')
+
+            # Balance sheet metrics
+            total_assets = safe_get(balance_data, 'Total Assets', 'TotalAssets')
+            total_liabilities = safe_get(balance_data, 'Total Liabilities Net Minority Interest',
+                                         'Total Liab', 'TotalLiabilities')
+            total_equity = safe_get(balance_data, 'Total Equity Gross Minority Interest',
+                                    'Stockholders Equity', 'Total Stockholder Equity', 'TotalEquity')
+            current_assets = safe_get(balance_data, 'Current Assets', 'TotalCurrentAssets')
+            current_liabilities = safe_get(balance_data, 'Current Liabilities', 'TotalCurrentLiabilities')
+            inventory = safe_get(balance_data, 'Inventory', 'Inventories')
+            cash = safe_get(balance_data, 'Cash And Cash Equivalents', 'Cash',
+                           'Cash Cash Equivalents And Short Term Investments')
+
+            # Cash flow metrics
+            dividends_paid = safe_get(cashflow_data, 'Cash Dividends Paid', 'Dividends Paid',
+                                      'Common Stock Dividend Paid')
+
+            # Shares outstanding from info
+            shares_out = info.get('sharesOutstanding')
+            if shares_out:
+                shares_out = float(shares_out)
+
+            # Calculate per-share metrics
+            eps = None
+            if net_income is not None and shares_out:
+                eps = net_income / shares_out
+            else:
+                eps = info.get('trailingEps')
+
+            bps = None
+            if total_equity is not None and shares_out:
+                bps = total_equity / shares_out
+            else:
+                bps = info.get('bookValue')
+
+            dps = None
+            if dividends_paid is not None and shares_out:
+                dps = abs(dividends_paid) / shares_out
+
+            # Calculate ratios
+            cur_ratio = None
+            if current_assets is not None and current_liabilities is not None and current_liabilities != 0:
+                cur_ratio = current_assets / current_liabilities
+            else:
+                cur_ratio = info.get('currentRatio')
+
+            quick_ratio = None
+            if current_assets is not None and inventory is not None and current_liabilities is not None and current_liabilities != 0:
+                quick_ratio = (current_assets - (inventory or 0)) / current_liabilities
+            else:
+                quick_ratio = info.get('quickRatio')
+
+            cash_ratio = None
+            if cash is not None and current_liabilities is not None and current_liabilities != 0:
+                cash_ratio = cash / current_liabilities
+
+            debt_ratio = None
+            if total_liabilities is not None and total_assets is not None and total_assets != 0:
+                debt_ratio = total_liabilities / total_assets
+
+            debt_to_equity = None
+            if total_liabilities is not None and total_equity is not None and total_equity != 0:
+                debt_to_equity = total_liabilities / total_equity
+            else:
+                debt_to_equity = info.get('debtToEquity')
+                if debt_to_equity:
+                    debt_to_equity = debt_to_equity / 100  # Yahoo returns as percentage
+
+            # Valuation ratios
+            pe = None
+            if pd.notna(adj_close) and eps is not None and eps != 0:
+                pe = adj_close / eps
+            else:
+                pe = info.get('trailingPE')
+
+            pb = None
+            if pd.notna(adj_close) and bps is not None and bps != 0:
+                pb = adj_close / bps
+            else:
+                pb = info.get('priceToBook')
+
+            ps = info.get('priceToSalesTrailing12Months')
+
+            # Return on equity
+            roe = None
+            if net_income is not None and total_equity is not None and total_equity != 0:
+                roe = net_income / total_equity
+            else:
+                roe = info.get('returnOnEquity')
+
+            # Net income ratio
+            net_income_ratio = None
+            if net_income is not None and revenue is not None and revenue != 0:
+                net_income_ratio = net_income / revenue
+            else:
+                net_income_ratio = info.get('profitMargins')
+
+            # Accounts receivable turnover
+            acc_rec = safe_get(balance_data, 'Accounts Receivable', 'Net Receivables', 'Receivables')
+            acc_rec_turnover = None
+            if revenue is not None and acc_rec is not None and acc_rec != 0:
+                acc_rec_turnover = revenue / acc_rec
+
+            return {
+                'gvkey': ticker,
+                'datadate': datadate.strftime('%Y-%m-%d'),
+                'tic': ticker,
+                'gsector': gsector,
+                'adj_close_q': adj_close if pd.notna(adj_close) else np.nan,
+                'EPS': eps if eps is not None else np.nan,
+                'BPS': bps if bps is not None else np.nan,
+                'DPS': dps if pd.notna(dps) else np.nan,
+                'cur_ratio': cur_ratio if cur_ratio is not None else np.nan,
+                'quick_ratio': quick_ratio if quick_ratio is not None else np.nan,
+                'cash_ratio': cash_ratio if cash_ratio is not None else np.nan,
+                'acc_rec_turnover': acc_rec_turnover if acc_rec_turnover is not None else np.nan,
+                'debt_ratio': debt_ratio if debt_ratio is not None else np.nan,
+                'debt_to_equity': debt_to_equity if debt_to_equity is not None else np.nan,
+                'pe': pe if pe is not None else np.nan,
+                'ps': ps if ps is not None else np.nan,
+                'pb': pb if pb is not None else np.nan,
+                'roe': roe if pd.notna(roe) else np.nan,
+                'net_income_ratio': net_income_ratio if net_income_ratio is not None else np.nan,
+            }
+
+        except Exception as e:
+            logger.debug(f"Error calculating fundamentals for {ticker}: {e}")
+            return None
+
+    def get_price_data(self, tickers: pd.DataFrame | List[str],
+                      start_date: str, end_date: str) -> pd.DataFrame:
+        """Get historical price data from Yahoo Finance."""
+        # Convert tickers to list if DataFrame
+        if isinstance(tickers, pd.DataFrame):
+            ticker_list = tickers['tickers'].astype(str).tolist()
+        else:
+            ticker_list = list(tickers)
+
+        all_data = []
+
+        for ticker in tqdm(ticker_list, desc="Fetching Yahoo price data"):
+            try:
+                yf_ticker = yf.Ticker(ticker)
+                hist = yf_ticker.history(start=start_date, end=end_date, auto_adjust=False)
+
+                if hist.empty:
+                    continue
+
+                hist = hist.reset_index()
+                hist['tic'] = ticker
+                hist['gvkey'] = ticker
+                hist = hist.rename(columns={
+                    'Date': 'datadate',
+                    'Open': 'prcod',
+                    'High': 'prchd',
+                    'Low': 'prcld',
+                    'Close': 'prccd',
+                    'Adj Close': 'adj_close',
+                    'Volume': 'cshtrd'
+                })
+
+                # Ensure datadate is string format
+                hist['datadate'] = pd.to_datetime(hist['datadate']).dt.strftime('%Y-%m-%d')
+
+                all_data.append(hist[['gvkey', 'datadate', 'tic', 'prccd', 'prcod',
+                                      'prchd', 'prcld', 'cshtrd', 'adj_close']])
+
+            except Exception as e:
+                logger.error(f"Error fetching price data for {ticker}: {e}")
+                continue
+
+        if all_data:
+            return pd.concat(all_data, ignore_index=True)
+        return pd.DataFrame()
+
+    def get_news(self, ticker: str, from_date: str, to_date: str,
+                 analyze_sentiment: bool = False,
+                 sentiment_model: Optional[str] = None,
+                 force_refresh: bool = False) -> pd.DataFrame:
+        """Get news for a ticker from Yahoo Finance."""
+        try:
+            yf_ticker = yf.Ticker(ticker)
+            news = yf_ticker.news
+
+            if not news:
+                return pd.DataFrame()
+
+            df = pd.DataFrame(news)
+
+            # Filter by date if possible
+            if 'providerPublishTime' in df.columns:
+                df['publishedDate'] = pd.to_datetime(df['providerPublishTime'], unit='s')
+                df = df[(df['publishedDate'] >= from_date) & (df['publishedDate'] <= to_date)]
+
+            return df
+
+        except Exception as e:
+            logger.error(f"Error fetching news for {ticker}: {e}")
+            return pd.DataFrame()
+
+
 class DataSourceManager:
     """Manager for multiple data sources with automatic fallback."""
 
@@ -1053,7 +1459,8 @@ class DataSourceManager:
 
         # Initialize data sources in priority order
         self.data_sources = [
-            ('FMP', FMPFetcher(cache_dir))
+            ('FMP', FMPFetcher(cache_dir)),
+            ('YAHOO', YahooFinanceFetcher(cache_dir))
         ]
 
         # Determine best available source
@@ -1130,21 +1537,24 @@ _data_manager_config = {}
 def get_data_manager(cache_dir: str = "./data/cache", preferred_source: Optional[str] = None) -> DataSourceManager:
     """
     Get global data source manager instance.
-    
+
     Args:
         cache_dir: Directory for caching data
-        preferred_source: Preferred data source name ('FMP'), 
+        preferred_source: Preferred data source name ('FMP' or 'YAHOO'),
                         None for automatic selection
-    
+
     Returns:
         DataSourceManager instance
-        
+
     Examples:
         # Automatic selection (default)
         manager = get_data_manager()
-        
+
         # Force use FMP (if API key is configured)
         manager = get_data_manager(preferred_source='FMP')
+
+        # Use Yahoo Finance (no API key needed)
+        manager = get_data_manager(preferred_source='YAHOO')
     """
     global _data_manager, _data_manager_config
     
