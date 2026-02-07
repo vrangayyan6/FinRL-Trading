@@ -1051,9 +1051,14 @@ class YahooFinanceFetcher(BaseDataFetcher, DataSource):
     def get_sp500_components(self, date: str = None) -> pd.DataFrame:
         """Get S&P 500 components from Wikipedia."""
         try:
-            # Fetch S&P 500 list from Wikipedia
+            # Fetch S&P 500 list from Wikipedia with proper headers
             url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-            tables = pd.read_html(url)
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            }
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            tables = pd.read_html(response.text)
             sp500_table = tables[0]
 
             # Standardize column names
