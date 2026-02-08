@@ -437,7 +437,7 @@ class AlpacaManager:
             market_value = float(position['market_value'])
             current_weights[symbol] = (market_value / portfolio_value) if portfolio_value > 0 else 0.0
 
-        # FilterÓë¹æ·¶»¯: ½ö±£Áô¿É½»Ò×±êµÄ£»¸ºÈ¨ÖØÊÓÎª0£»±ØÒªÊ±¹éÒ»»¯µ½<=1
+        # Filterï¿½ï¿½ï¿½æ·¶ï¿½ï¿½: ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½É½ï¿½ï¿½×±ï¿½ï¿½Ä£ï¿½ï¿½ï¿½È¨ï¿½ï¿½ï¿½ï¿½Îª0ï¿½ï¿½ï¿½ï¿½ÒªÊ±ï¿½ï¿½Ò»ï¿½ï¿½ï¿½ï¿½<=1
         filtered_targets: Dict[str, float] = {}
         raw_targets = target_weights or {}
         for s, w in raw_targets.items():
@@ -457,11 +457,11 @@ class AlpacaManager:
         sum_w = sum(filtered_targets.values())
         used_target_weights: Dict[str, float]
         if sum_w > 1.0001:
-            # ÈôÈ¨ÖØºÍ>1£¬°´×ÜºÍ½øÐÐËõ·Å¹éÒ»»¯
+            # ï¿½ï¿½È¨ï¿½Øºï¿½>1ï¿½ï¿½ï¿½ï¿½ï¿½ÜºÍ½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Å¹ï¿½Ò»ï¿½ï¿½
             used_target_weights = {s: (w / sum_w) for s, w in filtered_targets.items()}
             self.logger.info(f"Target weights sum {sum_w:.6f} > 1; normalized to 1.0 proportionally")
         else:
-            # ºÍ<=1Ôò±£Áô£¬ÔÊÐíÊ£ÓàÏÖ½ð
+            # ï¿½ï¿½<=1ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê£ï¿½ï¿½ï¿½Ö½ï¿½
             used_target_weights = dict(filtered_targets)
 
         all_symbols = set(current_weights.keys()) | set(used_target_weights.keys())
@@ -885,6 +885,15 @@ def create_alpaca_account_from_env(name: str = "default") -> AlpacaAccount:
     api_key = config.alpaca.api_key
     api_secret = config.alpaca.api_secret
     base_url = config.alpaca.base_url
+
+    # Fallback to environment variables if not found in config
+    # Supports both standard Alpaca vars (APCA_) and Notebook vars (ALPACA_)
+    if not api_key:
+        api_key = os.environ.get("ALPACA_API_KEY") or os.environ.get("APCA_API_KEY_ID") or os.environ.get("APCA_API_KEY")
+    if not api_secret:
+        api_secret = os.environ.get("ALPACA_SECRET_KEY") or os.environ.get("APCA_API_SECRET_KEY") or os.environ.get("APCA_API_SECRET")
+    if not base_url:
+        base_url = os.environ.get("ALPACA_BASE_URL") or os.environ.get("APCA_API_BASE_URL") or "https://paper-api.alpaca.markets"
 
     if not api_key or not api_secret:
         raise ValueError("Alpaca API credentials not found in environment variables")
