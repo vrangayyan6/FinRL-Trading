@@ -437,7 +437,7 @@ class AlpacaManager:
             market_value = float(position['market_value'])
             current_weights[symbol] = (market_value / portfolio_value) if portfolio_value > 0 else 0.0
 
-        # Filter���淶��: �������ɽ��ױ��ģ���Ȩ����Ϊ0����Ҫʱ��һ����<=1
+        # Filter logic: filter out non-tradable, set weight to 0 if invalid, ensure sum <=1
         filtered_targets: Dict[str, float] = {}
         raw_targets = target_weights or {}
         for s, w in raw_targets.items():
@@ -457,11 +457,11 @@ class AlpacaManager:
         sum_w = sum(filtered_targets.values())
         used_target_weights: Dict[str, float]
         if sum_w > 1.0001:
-            # ��Ȩ�غ�>1�����ܺͽ������Ź�һ��
+            # If total weight > 1, normalize proportionally
             used_target_weights = {s: (w / sum_w) for s, w in filtered_targets.items()}
             self.logger.info(f"Target weights sum {sum_w:.6f} > 1; normalized to 1.0 proportionally")
         else:
-            # ��<=1������������ʣ���ֽ�
+            # If total weight <= 1, keep as is (remainder is cash)
             used_target_weights = dict(filtered_targets)
 
         all_symbols = set(current_weights.keys()) | set(used_target_weights.keys())

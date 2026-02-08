@@ -396,16 +396,16 @@ class FMPFetcher(BaseDataFetcher, DataSource):
                 body = body[:1500]
 
             prompt = (
-                "请阅读以下新闻并判断整体情绪是 positive、neutral 还是 negative。"
-                " 仅返回 JSON，如 {\"sentiment\": \"neutral\", \"confidence\": 0.65}。"
-                f"\n标题: {title}\n内容: {body}"
+                "Please read the following news and determine if the overall sentiment is positive, neutral, or negative."
+                " Return only JSON, e.g., {\"sentiment\": \"neutral\", \"confidence\": 0.65}."
+                f"\nTitle: {title}\nContent: {body}"
             )
 
             try:
                 response = client.chat.completions.create(
                     model=model,
                     messages=[
-                        {"role": "system", "content": "你是一名金融新闻情绪分析助手，只输出JSON。"},
+                        {"role": "system", "content": "You are a financial news sentiment analysis assistant, output only JSON."},
                         {"role": "user", "content": prompt}
                     ],
                     temperature=0.1,
@@ -612,7 +612,7 @@ class FMPFetcher(BaseDataFetcher, DataSource):
                 # price data for quarter adj_close (need next quarter too)
                 
                 prices_t = prices[prices['tic'] == ticker].copy() if not prices.empty else pd.DataFrame()
-                # 按日期降序排序，以便于向前查找最近价格时能正确获取
+                # Sort by date descending to correctly find the nearest price when looking forward
                 if not prices_t.empty and 'datadate' in prices_t.columns:
                     prices_t = prices_t.sort_values('datadate', ascending=False)
 
@@ -626,18 +626,18 @@ class FMPFetcher(BaseDataFetcher, DataSource):
                             period_raw = it.get('period')
                             period = str(period_raw).upper() if period_raw is not None else None
                             if year is not None and period:
-                                # 统一使用 calendarYear + period(Q1/Q2/Q3/Q4) 的季度末日期作为键
+                                # Uniformly use calendarYear + period(Q1/Q2/Q3/Q4) quarter-end date as key
                                 q_map = {
                                     'Q1': (3, 31), 
                                     'Q2': (6, 30), 
                                     'Q3': (9, 30), 
                                     'Q4': (12, 31),
-                                    'FY': (12, 31),  # 若出现 FY，按 Q4 处理
+                                    'FY': (12, 31),  # If FY appears, treat as Q4
                                 }
                                 md = q_map.get(period)
                                 if md:
                                     key_ts = pd.Timestamp(int(year), md[0], md[1])
-                            # 若缺失 calendarYear/period，则回退到原始 date，再映射到所在公历季度末
+                            # If calendarYear/period is missing, fallback to original date, then map to the quarter-end of the calendar year
                             if key_ts is None and 'date' in it and it.get('date'):
                                 d = pd.to_datetime(it['date'], errors='coerce')
                                 if pd.notna(d):
@@ -662,6 +662,7 @@ class FMPFetcher(BaseDataFetcher, DataSource):
                 inrange_quarters = [d for d in all_quarter_dates if start_dt <= d <= end_dt]
 
                 # If aligning, create a mapping from original qd -> aligned date (仅用于计算 y_return 的价格)
+                # If aligning, create a mapping from original qd -> aligned date (only used for calculating y_return price)
                 if align_quarter_dates:
                     aligned_dates = {qd: align_to_mjsd_first(qd) for qd in inrange_quarters}
                 else:
@@ -701,13 +702,13 @@ class FMPFetcher(BaseDataFetcher, DataSource):
                     except Exception:
                         revenue = 0.0
 
-                    # 价格：区分原始季度日与对齐日
+                    # Price: distinguish between original quarter date and aligned date
                     prccd_orig = np.nan
                     adj_close_orig = np.nan
                     prccd_aligned = np.nan
                     adj_close_aligned = np.nan
                     if not prices_t.empty and 'datadate' in prices_t.columns:
-                        # 原始季度日价格：使用 qd 之后最近的交易日
+                        # Original quarter date price: use the nearest trading day after qd
                         qd_str = qd.strftime('%Y-%m-%d')
                         price_row_orig = prices_t[prices_t['datadate'] > qd_str].head(1)
                         if not price_row_orig.empty:
@@ -716,7 +717,7 @@ class FMPFetcher(BaseDataFetcher, DataSource):
                             if pd.notna(ac_o):
                                 adj_close_orig = float(ac_o)
 
-                        # 对齐日价格：仅当开启对齐时计算，用于 y_return
+                        # Aligned date price: calculated only when alignment is enabled, used for y_return
                         if align_quarter_dates:
                             aligned_date_str = aligned_date.strftime('%Y-%m-%d')
                             max_days_forward = 10
@@ -819,12 +820,12 @@ class FMPFetcher(BaseDataFetcher, DataSource):
                         'datadate': aligned_date.strftime('%Y-%m-%d') if align_quarter_dates else qd.strftime('%Y-%m-%d'),
                         'tic': ticker,
                         'gsector': gsector,
-                        # 基本面倍数等一律使用原始季度日价格
+                        # Fundamental multiples etc. always use original quarter date price
                         # 'prccd': prccd_orig if pd.notna(prccd_orig) else np.nan,
                         # 'ajexdi': ajexdi,
-                        # y_return 所用价格：若对齐开启则用对齐价，否则用原始价
+                        # Price used for y_return: if alignment is enabled use aligned price, otherwise use original price
                         'adj_close_q': (adj_close_aligned if align_quarter_dates and pd.notna(adj_close_aligned) else adj_close_orig) if pd.notna(adj_close_orig) or pd.notna(adj_close_aligned) else np.nan,
-                        # 记录原始季度日的调整收盘价，供特征/倍数使用
+                        # Record adjusted close price of original quarter date, for features/multiples use
                         # 'adj_close': adj_close_orig if pd.notna(adj_close_orig) else np.nan,
                         'EPS': eps if eps is not None else np.nan,
                         'BPS': bps if bps is not None else np.nan,
@@ -983,7 +984,7 @@ class FMPFetcher(BaseDataFetcher, DataSource):
             
             for ticker, date_ranges in tqdm(tickers_to_fetch.items()):
                 try:
-                    # 取最小和最大日期
+                    # Get min and max date
                     min_date = min(start for start, _ in date_ranges)
                     max_date = max(end for _, end in date_ranges)
 
@@ -1649,16 +1650,16 @@ def fetch_news(ticker: str, start_date: str, end_date: str,
                force_refresh: bool = False,
                preferred_source='FMP') -> pd.DataFrame:
     """
-    Fetch news for a ticker with optional GPT情绪分析.
+    Fetch news for a ticker with optional GPT sentiment analysis.
 
     Args:
-        ticker: 股票代码
-        start_date: 起始日期 (YYYY-MM-DD)
-        end_date: 结束日期 (YYYY-MM-DD)
-        analyze_sentiment: 是否调用 GPT 进行情绪分析
-        sentiment_model: 覆盖默认 GPT 模型
-        force_refresh: 是否忽略缓存强制重新抓取
-        preferred_source: 指定数据源
+        ticker: Ticker symbol
+        start_date: Start date (YYYY-MM-DD)
+        end_date: End date (YYYY-MM-DD)
+        analyze_sentiment: Whether to use GPT for sentiment analysis
+        sentiment_model: Override default GPT model
+        force_refresh: Whether to ignore cache and force re-fetch
+        preferred_source: Specify data source
 
     Returns:
         DataFrame of news articles with sentiment metadata.
@@ -1686,7 +1687,7 @@ if __name__ == "__main__":
     components = fetch_sp500_tickers()
     print(f"Fetched {len(components)} tickers")
 
-    # # 按字母顺序对tickers排序
+    # # Sort tickers alphabetically
     # tickers = sorted(tickers)
     # tickers = ["AEP", "ADM", "INCY", "LIN", "URI", "NVDA"]
     tickers = ["NVDA"]
@@ -1716,7 +1717,7 @@ if __name__ == "__main__":
     # )
     # print(f"Fetched {len(prices)} price records")
 
-    # Fetch news sample with情绪分析（需配置 FMP & OpenAI API Key）
+    # Fetch news sample with sentiment analysis (requires FMP & OpenAI API Key configuration)
     news_df = fetch_news(
         ticker="NVDA",
         start_date="2025-01-01",
