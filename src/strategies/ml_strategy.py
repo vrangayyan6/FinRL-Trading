@@ -324,6 +324,19 @@ class MLStockSelectionStrategy(BaseStrategy):
         
         return result
 
+    def apply_risk_limits(self, weights_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Apply risk limits to weights (normalization).
+        """
+        if weights_df.empty or 'weight' not in weights_df.columns:
+            return weights_df
+        
+        # Normalize to sum to 1
+        w_sum = weights_df['weight'].sum()
+        if w_sum > 0:
+            weights_df['weight'] = weights_df['weight'] / w_sum
+            
+        return weights_df
 
     def _build_candidate_models(self) -> Dict[str, Any]:
         """Build candidate models similar to ml_model.py (rf/gbm, optional xgb/lgbm)."""
