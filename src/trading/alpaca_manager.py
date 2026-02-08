@@ -36,7 +36,7 @@ class AlpacaAccount:
     name: str
     api_key: str
     api_secret: str
-    base_url: str = "https://paper-api.alpaca.markets"
+    base_url: str = "https://paper-api.alpaca.markets/v2"
 
     @property
     def is_paper(self) -> bool:
