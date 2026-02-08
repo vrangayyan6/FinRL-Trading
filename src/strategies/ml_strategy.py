@@ -1060,12 +1060,22 @@ class SectorNeutralMLStrategy(MLStockSelectionStrategy):
                     'threshold': thr,
                 }
 
+        # if not selected_all:
+        #     self.logger.warning("No sector produced selections")
+        #     return StrategyResult(
+        #         strategy_name=self.config.name,
+        #         weights=pd.DataFrame(columns=['gvkey', 'weight']),
+        #         metadata={'error': 'no_sector_selection'}
+        #     )
+        # Locate the generate_weights method around line 1065
         if not selected_all:
             self.logger.warning("No sector produced selections")
+    
+            # FIX: Remove 'strategy_name=self.config.name'
             return StrategyResult(
-                strategy_name=self.config.name,
-                weights=pd.DataFrame(columns=['gvkey', 'weight']),
-                metadata={'error': 'no_sector_selection'}
+                weights=pd.DataFrame(columns=['gvkey', 'weight'])
+                # If StrategyResult requires other mandatory arguments (like metrics), add them here.
+                # e.g., metrics={}
             )
 
         merged = pd.concat(selected_all, ignore_index=True)
