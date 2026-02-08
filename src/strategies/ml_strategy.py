@@ -793,7 +793,6 @@ class MLStockSelectionStrategy(BaseStrategy):
         if len(fundamentals) == 0:
             self.logger.warning("No available fundamental data")
             return StrategyResult(
-                strategy_name=self.config.name,
                 weights=pd.DataFrame(columns=['gvkey', 'weight']),
                 metadata={'error': 'no_fundamentals'}
             )
@@ -838,7 +837,6 @@ class MLStockSelectionStrategy(BaseStrategy):
         except Exception as e:
             self.logger.error(f"Prediction failed: {e}")
             return StrategyResult(
-                strategy_name=self.config.name,
                 weights=pd.DataFrame(columns=['gvkey', 'weight']),
                 metadata={'error': f'fit_failed: {e}'}
             )
@@ -879,7 +877,6 @@ class MLStockSelectionStrategy(BaseStrategy):
             if not weights_list:
                 self.logger.warning("No stocks selected for any date in rolling mode")
                 return StrategyResult(
-                    strategy_name=self.config.name,
                     weights=pd.DataFrame(columns=['gvkey', 'weight', 'predicted_return', 'date']),
                     metadata={'error': 'no_predictions_all_dates', 'mode': 'rolling', 'top_quantile': top_quantile}
                 )
@@ -894,7 +891,6 @@ class MLStockSelectionStrategy(BaseStrategy):
             }
 
             result = StrategyResult(
-                strategy_name=self.config.name,
                 weights=weights_df[['gvkey', 'weight', 'predicted_return', 'date']],
                 metadata=meta_out
             )
@@ -906,7 +902,6 @@ class MLStockSelectionStrategy(BaseStrategy):
             if pred_df.empty:
                 self.logger.warning("No predictable stocks for target date")
                 return StrategyResult(
-                    strategy_name=self.config.name,
                     weights=pd.DataFrame(columns=['gvkey', 'weight']),
                     metadata={'error': 'no_predictions', **meta}
                 )
@@ -933,7 +928,6 @@ class MLStockSelectionStrategy(BaseStrategy):
                 weights_df = self.apply_risk_limits(weights_df)
 
             result = StrategyResult(
-                strategy_name=self.config.name,
                 weights=weights_df,
                 metadata={
                     'n_selected_stocks': len(weights_df),
@@ -1115,14 +1109,12 @@ class SectorNeutralMLStrategy(MLStockSelectionStrategy):
 
             if not weights_list:
                 return StrategyResult(
-                    strategy_name=self.config.name,
                     weights=pd.DataFrame(columns=['gvkey', 'weight', 'predicted_return', 'sector', 'date']),
                     metadata={'error': 'no_sector_selection_all_dates', 'mode': 'rolling'}
                 )
 
             weights_df = pd.concat(weights_list, ignore_index=True)
             result = StrategyResult(
-                strategy_name=self.config.name,
                 weights=weights_df[['gvkey', 'weight', 'predicted_return', 'sector', 'date']].copy(),
                 metadata={
                     'mode': 'rolling',
@@ -1151,7 +1143,6 @@ class SectorNeutralMLStrategy(MLStockSelectionStrategy):
             weights_df = self.apply_risk_limits(weights_df)
 
             result = StrategyResult(
-                strategy_name=self.config.name,
                 weights=weights_df,
                 metadata={
                     'n_selected_stocks': len(weights_df),
