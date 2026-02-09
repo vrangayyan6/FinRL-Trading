@@ -36,7 +36,7 @@ class AlpacaAccount:
     name: str
     api_key: str
     api_secret: str
-    base_url: str = "https://paper-api.alpaca.markets/v2"
+    base_url: str = "https://paper-api.alpaca.markets"
 
     @property
     def is_paper(self) -> bool:
@@ -746,7 +746,12 @@ class AlpacaManager:
         if account is None:
             account = self._get_account()
 
-        url = f"{account.base_url}{path}"
+        # Handle potential double /v2 in URL
+        base_url = account.base_url.rstrip('/')
+        if base_url.endswith('/v2') and path.startswith('/v2'):
+            base_url = base_url[:-3]
+
+        url = f"{base_url}{path}"
         headers = {
             'APCA-API-KEY-ID': account.api_key,
             'APCA-API-SECRET-KEY': account.api_secret,
