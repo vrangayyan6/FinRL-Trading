@@ -746,9 +746,12 @@ class AlpacaManager:
         if account is None:
             account = self._get_account()
 
-        # Handle potential double /v2 in URL
-        base_url = account.base_url.rstrip('/')
-        if base_url.endswith('/v2') and path.startswith('/v2'):
+        # Robustly handle base URL formatting
+        # 1. Strip whitespace
+        # 2. Remove trailing slash
+        # 3. Remove trailing /v2 if present (since path includes /v2)
+        base_url = account.base_url.strip().rstrip('/')
+        if base_url.endswith('/v2'):
             base_url = base_url[:-3]
 
         url = f"{base_url}{path}"
@@ -766,7 +769,7 @@ class AlpacaManager:
 
             if response.status_code >= 400:
                 error_info = response.json() if response.headers.get('content-type', '').startswith('application/json') else {'message': response.text}
-                raise RuntimeError(f"Alpaca API error {response.status_code}: {error_info}")
+                raise RuntimeError(f"Alpaca API error {response.status_code}: {error_info} (URL: {url})")
 
             if response.status_code == 204:  # No content
                 return {}
@@ -900,6 +903,12 @@ def create_alpaca_account_from_env(name: str = "default") -> AlpacaAccount:
     if not base_url:
         base_url = os.environ.get("ALPACA_BASE_URL") or os.environ.get("APCA_API_BASE_URL") or "https://paper-api.alpaca.markets"
 
+    # Clean base URL
+    if base_url:
+        base_url = base_url.strip().rstrip('/')
+        if base_url.endswith('/v2'):
+            base_url = base_url[:-3]
+
     if not api_key or not api_secret:
         raise ValueError("Alpaca API credentials not found in environment variables")
 
@@ -923,11 +932,17 @@ def create_multiple_accounts_from_config(config: Dict[str, Dict]) -> List[Alpaca
     """
     accounts = []
     for name, settings in config.items():
+        base_url = settings.get('base_url', 'https://paper-api.alpaca.markets')
+        if base_url:
+            base_url = base_url.strip().rstrip('/')
+            if base_url.endswith('/v2'):
+                base_url = base_url[:-3]
+
         accounts.append(AlpacaAccount(
             name=name,
             api_key=settings['api_key'],
             api_secret=settings['api_secret'],
-            base_url=settings.get('base_url', 'https://paper-api.alpaca.markets')
+            base_url=base_url
         ))
 
     return accounts
