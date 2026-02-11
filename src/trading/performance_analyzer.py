@@ -66,7 +66,7 @@ def get_benchmark_data(start_date: str, end_date: str) -> pd.DataFrame:
     #print(f"[DEBUG] Benchmark data from {start_date} to {end_date}")
     print(f"***************start_date is {start_date}******************")
     print(f"***************end_date is {end_date}******************")
-    df = fetch_price_data(['SPY', 'QQQ'], start_date, end_date)
+    df = fetch_price_data(['SPY', 'QQQ'], start_date, end_date, preferred_source='YAHOO')
     
     if df.empty or 'datadate' not in df.columns:
         print("Warning: No benchmark data fetched.")
