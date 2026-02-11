@@ -1564,6 +1564,10 @@ def get_data_manager(cache_dir: str = "./data/cache", preferred_source: Optional
     """
     global _data_manager, _data_manager_config
     
+    # If preferred_source is None and we have a manager, return it
+    if _data_manager is not None and preferred_source is None:
+        return _data_manager
+
     # Check if we need to recreate the manager
     current_config = {'cache_dir': cache_dir, 'preferred_source': preferred_source}
     
@@ -1575,7 +1579,7 @@ def get_data_manager(cache_dir: str = "./data/cache", preferred_source: Optional
 
 
 # Convenience functions for backward compatibility
-def fetch_sp500_tickers(output_path: str = "./data/sp500_tickers.csv", preferred_source='FMP') -> List[str]:
+def fetch_sp500_tickers(output_path: str = "./data/sp500_tickers.csv", preferred_source=None) -> List[str]:
     """Fetch S&P 500 tickers and save to file."""
     manager = get_data_manager(preferred_source=preferred_source)
     components = manager.get_sp500_components()
@@ -1592,7 +1596,7 @@ def fetch_sp500_tickers(output_path: str = "./data/sp500_tickers.csv", preferred
 
 
 def fetch_fundamental_data(tickers: List[str] | pd.DataFrame, start_date: str, end_date: str,
-                          align_quarter_dates: bool = False, preferred_source='FMP') -> pd.DataFrame:
+                          align_quarter_dates: bool = False, preferred_source=None) -> pd.DataFrame:
     """
     Fetch fundamental data for tickers.
     
@@ -1619,7 +1623,7 @@ def fetch_fundamental_data(tickers: List[str] | pd.DataFrame, start_date: str, e
 
 
 def fetch_price_data(tickers: List[str] | pd.DataFrame, start_date: str, end_date: str,
-                    preferred_source='FMP') -> pd.DataFrame:
+                    preferred_source=None) -> pd.DataFrame:
     """
     Fetch price data for tickers.
     
@@ -1648,7 +1652,7 @@ def fetch_news(ticker: str, start_date: str, end_date: str,
                analyze_sentiment: bool = False,
                sentiment_model: Optional[str] = None,
                force_refresh: bool = False,
-               preferred_source='FMP') -> pd.DataFrame:
+               preferred_source=None) -> pd.DataFrame:
     """
     Fetch news for a ticker with optional GPT sentiment analysis.
 
