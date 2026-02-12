@@ -626,9 +626,19 @@ class MLStockSelectionStrategy(BaseStrategy):
         feature_cols = [col for col in X.columns if not col.startswith('Unnamed:')]
         X_train = df_xy.loc[train_mask, feature_cols]
         y_train = df_xy.loc[train_mask, 'y_return']
+        
+        # Filter out NaNs in y_train
+        mask_y_train = y_train.notna()
+        X_train = X_train.loc[mask_y_train]
+        y_train = y_train.loc[mask_y_train]
 
         X_test = df_xy.loc[test_mask, feature_cols]
         y_test = df_xy.loc[test_mask, 'y_return']
+        
+        # Filter out NaNs in y_test
+        mask_y_test = y_test.notna()
+        X_test = X_test.loc[mask_y_test]
+        y_test = y_test.loc[mask_y_test]
 
         X_trade = df_xy.loc[trade_mask, feature_cols]
         # Align gvkey with the same valid rows used for X/y to avoid mismatch
