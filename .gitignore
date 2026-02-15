@@ -110,7 +110,7 @@ ENV/
 env.bak/
 venv.bak/
 .finrl_venv/
-null
+nul
 
 # Spyder project settings
 .spyderproject
