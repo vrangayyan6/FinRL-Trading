@@ -307,6 +307,152 @@ class DataProcessor:
         return sector_data
 
 
+# ---------------------------------------------------------------------------
+# Standalone daily feature engineering functions
+# ---------------------------------------------------------------------------
+
+def compute_daily_features(prices_df: pd.DataFrame) -> pd.DataFrame:
+    """Compute daily technical indicators and forward return from raw price data.
+
+    Input: long-format daily price data from ``fetch_price_data()`` with at
+    least columns ``[tic, datadate, adj_close]``.
+
+    Computed features (per ticker):
+      - daily_return, momentum_5d / 10d / 20d
+      - volatility_20d / 60d  (rolling std of daily returns)
+      - sma_5 / 10 / 20 / 50 / 200
+      - rsi_14, macd, macd_signal
+      - y_return  (forward 1-day log return — prediction target)
+
+    Rows where any indicator is NaN (warmup period) are dropped.
+
+    Returns:
+        Enriched DataFrame with the same identity columns plus all indicators.
+    """
+    df = prices_df.copy()
+    df['datadate'] = pd.to_datetime(df['datadate'])
+    df = df.sort_values(['tic', 'datadate']).reset_index(drop=True)
+
+    grp = df.groupby('tic')
+
+    # --- Daily return ---
+    df['daily_return'] = grp['adj_close'].pct_change()
+
+    # --- Momentum (past returns) ---
+    for period in [5, 10, 20]:
+        df[f'momentum_{period}d'] = grp['adj_close'].pct_change(period)
+
+    # --- Volatility ---
+    df['volatility_20d'] = grp['daily_return'].transform(
+        lambda s: s.rolling(20).std()
+    )
+    df['volatility_60d'] = grp['daily_return'].transform(
+        lambda s: s.rolling(60).std()
+    )
+
+    # --- Simple Moving Averages ---
+    for period in [5, 10, 20, 50, 200]:
+        df[f'sma_{period}'] = grp['adj_close'].transform(
+            lambda s: s.rolling(period).mean()
+        )
+
+    # --- RSI (14-period) ---
+    def _rsi(series, period=14):
+        delta = series.diff()
+        gain = delta.where(delta > 0, 0.0).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0.0)).rolling(window=period).mean()
+        rs = gain / loss
+        return 100.0 - (100.0 / (1.0 + rs))
+
+    df['rsi_14'] = grp['adj_close'].transform(_rsi)
+
+    # --- MACD ---
+    df['ema_12'] = grp['adj_close'].transform(lambda s: s.ewm(span=12).mean())
+    df['ema_26'] = grp['adj_close'].transform(lambda s: s.ewm(span=26).mean())
+    df['macd'] = df['ema_12'] - df['ema_26']
+    df['macd_signal'] = df.groupby('tic')['macd'].transform(
+        lambda s: s.ewm(span=9).mean()
+    )
+    # Clean up intermediate columns
+    df.drop(columns=['ema_12', 'ema_26'], inplace=True)
+
+    # --- Forward 1-day log return (prediction target) ---
+    df['y_return'] = grp['adj_close'].transform(
+        lambda s: np.log(s.shift(-1) / s)
+    )
+
+    # --- Drop warmup NaN rows ---
+    indicator_cols = [
+        'daily_return', 'momentum_5d', 'momentum_10d', 'momentum_20d',
+        'volatility_20d', 'volatility_60d',
+        'sma_5', 'sma_10', 'sma_20', 'sma_50', 'sma_200',
+        'rsi_14', 'macd', 'macd_signal',
+    ]
+    df = df.dropna(subset=indicator_cols).reset_index(drop=True)
+
+    logger.info(
+        f"compute_daily_features: {len(df)} rows, "
+        f"{df['tic'].nunique()} tickers after warmup removal"
+    )
+    return df
+
+
+def merge_daily_with_fundamentals(
+    daily_df: pd.DataFrame,
+    fundamentals_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Merge daily technical features with the most recent quarterly fundamentals.
+
+    Uses ``pd.merge_asof`` to attach the latest available quarterly ratios
+    (PE, PB, ROE, debt_ratio, EPS, etc.) to each daily row.
+
+    Args:
+        daily_df: Output of ``compute_daily_features()`` — must contain
+            ``[tic, datadate]``.
+        fundamentals_df: Quarterly fundamental data — must contain
+            ``[tic, datadate]`` plus numeric ratio columns.
+
+    Returns:
+        Merged DataFrame where each row is one trading day for one stock,
+        with both daily technical indicators and quarterly fundamental ratios.
+    """
+    daily = daily_df.copy()
+    fund = fundamentals_df.copy()
+
+    daily['datadate'] = pd.to_datetime(daily['datadate'])
+    fund['datadate'] = pd.to_datetime(fund['datadate'])
+
+    # Select only the fundamental ratio columns we want to merge
+    # Exclude id/date columns that would collide with the daily side
+    fund_id_cols = {'gvkey', 'tic', 'datadate'}
+    fund_exclude = {'gvkey', 'datadate', 'adj_close_q', 'y_return'}
+    fund_ratio_cols = [
+        c for c in fund.columns
+        if c not in fund_exclude and c != 'tic'
+        and pd.api.types.is_numeric_dtype(fund[c])
+    ]
+
+    fund_for_merge = fund[['tic', 'datadate'] + fund_ratio_cols].copy()
+    fund_for_merge = fund_for_merge.sort_values(['tic', 'datadate'])
+
+    daily = daily.sort_values(['tic', 'datadate'])
+
+    merged = pd.merge_asof(
+        daily,
+        fund_for_merge,
+        on='datadate',
+        by='tic',
+        direction='backward',
+        suffixes=('', '_fund'),
+    )
+
+    logger.info(
+        f"merge_daily_with_fundamentals: {len(merged)} rows, "
+        f"{merged.shape[1]} columns"
+    )
+    return merged
+
+
 # Convenience functions
 def process_fundamentals(input_path: str, output_path: str = None) -> pd.DataFrame:
     """Process fundamental data."""
