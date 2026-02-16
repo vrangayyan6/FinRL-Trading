@@ -781,19 +781,249 @@ class MLStockSelectionStrategy(BaseStrategy):
 
         return result_df
 
+    # ------------------------------------------------------------------
+    # Daily frequency methods
+    # ------------------------------------------------------------------
+
+    def _prepare_daily_dataset(
+        self, daily_data: pd.DataFrame
+    ) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
+        """Prepare X, y, dates from daily data (technicals + quarterly fundamentals).
+
+        Similar to ``_prepare_supervised_dataset`` but operates on daily rows
+        produced by ``merge_daily_with_fundamentals``.
+
+        Returns:
+            X  – numeric feature DataFrame
+            y  – forward 1-day log return (``y_return``)
+            dates – aligned datetime Series
+        """
+        if 'y_return' not in daily_data.columns:
+            raise ValueError("daily_data missing y_return column")
+
+        exclude_cols = {
+            'gvkey', 'tic', 'datadate', 'y_return',
+            'adj_close', 'prccd', 'prcod', 'prchd', 'prcld', 'cshtrd',
+            'adj_close_q',
+        }
+        numeric_cols = [
+            c for c in daily_data.columns
+            if c not in exclude_cols and pd.api.types.is_numeric_dtype(daily_data[c])
+        ]
+        if not numeric_cols:
+            raise ValueError("No numeric feature columns found in daily data")
+
+        df = daily_data.copy()
+        df['datadate'] = pd.to_datetime(df['datadate'])
+
+        X = df[numeric_cols].replace([np.inf, -np.inf], np.nan).fillna(df[numeric_cols].median())
+        X = X.loc[:, X.nunique() > 1]
+
+        y = df['y_return'].astype(float)
+        dates = df['datadate']
+
+        valid = ~X.isna().any(axis=1)
+        return X.loc[valid], y.loc[valid], dates.loc[valid]
+
+    def _daily_train_predict(
+        self,
+        daily_data: pd.DataFrame,
+        train_days: int = 504,
+        val_days: int = 63,
+    ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        """Single-shot daily prediction: train on last *train_days*, validate on
+        last *val_days*, predict for the most recent trading day.
+
+        Returns:
+            pred_df  – DataFrame with ``['gvkey', 'predicted_return']``
+            meta     – dict with training metadata
+        """
+        X, y, dates = self._prepare_daily_dataset(daily_data)
+
+        # Re-attach gvkey so we can map predictions back
+        gvkey = daily_data.loc[X.index, 'gvkey' if 'gvkey' in daily_data.columns else 'tic'].reset_index(drop=True)
+
+        unique_dates = sorted(dates.unique())
+        if len(unique_dates) < train_days + val_days + 1:
+            raise ValueError(
+                f"Need at least {train_days + val_days + 1} unique trading days, "
+                f"got {len(unique_dates)}"
+            )
+
+        trade_date = unique_dates[-1]
+        val_start = unique_dates[-(val_days + 1)]
+        train_start = unique_dates[-(train_days + val_days + 1)]
+
+        mask_train = (dates >= pd.Timestamp(train_start)) & (dates < pd.Timestamp(val_start))
+        mask_val = (dates >= pd.Timestamp(val_start)) & (dates < pd.Timestamp(trade_date))
+        mask_trade = dates == pd.Timestamp(trade_date)
+
+        X_train, y_train = X.loc[mask_train], y.loc[mask_train]
+        X_val, y_val = X.loc[mask_val], y.loc[mask_val]
+        X_trade = X.loc[mask_trade]
+        gvkey_trade = gvkey.loc[mask_trade.values].reset_index(drop=True)
+
+        # Drop NaN targets from train/val
+        valid_tr = y_train.notna()
+        X_train, y_train = X_train.loc[valid_tr], y_train.loc[valid_tr]
+        valid_va = y_val.notna()
+        X_val, y_val = X_val.loc[valid_va], y_val.loc[valid_va]
+
+        if len(X_train) < 50 or len(X_trade) == 0:
+            raise ValueError(
+                f"Insufficient data: {len(X_train)} train rows, {len(X_trade)} trade rows"
+            )
+
+        # Scale
+        scaler = StandardScaler()
+        X_train_s = scaler.fit_transform(X_train)
+        X_val_s = scaler.transform(X_val) if len(X_val) > 0 else None
+        X_trade_s = scaler.transform(X_trade)
+
+        # Fit candidates and choose best
+        candidates = self._build_candidate_models()
+        best_name, best_mse, best_model = None, np.inf, None
+        metrics: Dict[str, float] = {}
+
+        for name, model in candidates.items():
+            try:
+                model.fit(X_train_s, y_train)
+                if X_val_s is not None and len(y_val) > 0:
+                    mse = mean_squared_error(y_val, model.predict(X_val_s))
+                else:
+                    mse = mean_squared_error(y_train, model.predict(X_train_s))
+                metrics[name] = mse
+                if mse < best_mse:
+                    best_mse, best_name, best_model = mse, name, model
+            except Exception as e:
+                logger.warning(f"Candidate {name} failed: {e}")
+
+        if best_model is None:
+            raise RuntimeError("All candidate models failed")
+
+        predicted = best_model.predict(X_trade_s)
+        pred_df = pd.DataFrame({
+            'gvkey': gvkey_trade.values,
+            'predicted_return': predicted,
+        })
+
+        meta = {
+            'trade_date': trade_date,
+            'train_days': train_days,
+            'val_days': val_days,
+            'train_samples': len(X_train),
+            'val_samples': len(X_val),
+            'trade_samples': len(X_trade),
+            'model_name': best_name,
+            'model_mse': best_mse,
+            'all_model_mse': metrics,
+            'n_features': X_train.shape[1],
+            'feature_names': list(X_train.columns),
+            'mode': 'daily',
+        }
+
+        self.logger.info(
+            f"Daily prediction: {best_name} (MSE={best_mse:.6f}), "
+            f"{len(pred_df)} stocks predicted for {trade_date.date() if hasattr(trade_date, 'date') else trade_date}"
+        )
+        return pred_df, meta
+
+    # ------------------------------------------------------------------
+    # Weight generation (supports quarterly and daily)
+    # ------------------------------------------------------------------
+
     def generate_weights(self, data: Dict[str, pd.DataFrame],
                         **kwargs) -> StrategyResult:
         """
         Generate portfolio weights using ML predictions.
 
         Args:
-            data: Dictionary containing fundamentals and price data
+            data: Dictionary containing fundamentals and price data.
+                  For daily mode, must also contain ``'daily'`` key with
+                  merged daily technicals + quarterly fundamentals.
             **kwargs: Additional parameters
+                - frequency: ``'quarterly'`` (default) or ``'daily'``
+                - train_days / val_days: used when frequency='daily'
 
         Returns:
             StrategyResult with ML-based weights
         """
         self.logger.info("Generating ML-based weights")
+
+        frequency = str(kwargs.get('frequency', 'quarterly')).lower()
+
+        # --------------------------------------------------------------
+        # Daily frequency path
+        # --------------------------------------------------------------
+        if frequency == 'daily':
+            if 'daily' not in data or len(data.get('daily', [])) == 0:
+                raise ValueError(
+                    "For frequency='daily', data must contain a 'daily' key "
+                    "with merged daily features (see compute_daily_features + merge_daily_with_fundamentals)"
+                )
+            daily_data = data['daily'].copy()
+            train_days = int(kwargs.get('train_days', 504))
+            val_days = int(kwargs.get('val_days', 63))
+
+            try:
+                pred_df, meta = self._daily_train_predict(
+                    daily_data=daily_data,
+                    train_days=train_days,
+                    val_days=val_days,
+                )
+            except Exception as e:
+                self.logger.error(f"Daily prediction failed: {e}")
+                return StrategyResult(
+                    weights=pd.DataFrame(columns=['gvkey', 'weight']),
+                    metadata={'error': f'daily_fit_failed: {e}'}
+                )
+
+            # Stock selection (same logic as quarterly single mode)
+            top_quantile = float(kwargs.get('top_quantile', 0.75))
+            weight_method = str(kwargs.get('weight_method', 'equal')).lower()
+            fundamentals = data.get('fundamentals', pd.DataFrame())
+            price_data = data.get('prices', None)
+
+            if pred_df.empty:
+                return StrategyResult(
+                    weights=pd.DataFrame(columns=['gvkey', 'weight']),
+                    metadata={'error': 'no_predictions', **meta}
+                )
+
+            threshold_raw = pred_df['predicted_return'].quantile(top_quantile)
+            threshold = max(float(threshold_raw), 0.0) if pd.notna(threshold_raw) else float('nan')
+            selected = pred_df[
+                (pred_df['predicted_return'] >= threshold) & (pred_df['predicted_return'] > 0)
+            ][['gvkey', 'predicted_return']].copy()
+
+            if len(selected) == 0:
+                weights_df = pd.DataFrame(columns=['gvkey', 'weight', 'predicted_return'])
+            else:
+                weights_df = self.allocate_weights(
+                    selected_stocks=selected,
+                    method=weight_method,
+                    fundamentals=fundamentals if len(fundamentals) > 0 else None,
+                    price_data=price_data,
+                    **kwargs
+                )
+                weights_df['date'] = meta.get('trade_date')
+                weights_df = self.apply_risk_limits(weights_df)
+
+            result = StrategyResult(
+                weights=weights_df,
+                metadata={
+                    'n_selected_stocks': len(weights_df),
+                    'selection_threshold': threshold if len(pred_df) > 0 else None,
+                    'top_quantile': top_quantile,
+                    **meta,
+                }
+            )
+            self.logger.info(f"Generated daily ML weights for {len(weights_df)} stocks")
+            return result
+
+        # --------------------------------------------------------------
+        # Quarterly frequency path (original behaviour)
+        # --------------------------------------------------------------
 
         # 1) Get real fundamental data
         if 'fundamentals' not in data or len(data['fundamentals']) == 0:
