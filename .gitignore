@@ -111,6 +111,7 @@ env.bak/
 venv.bak/
 .finrl_venv/
 nul
+.claude
 
 # Spyder project settings
 .spyderproject
