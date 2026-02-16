@@ -432,9 +432,9 @@ def merge_daily_with_fundamentals(
     ]
 
     fund_for_merge = fund[['tic', 'datadate'] + fund_ratio_cols].copy()
-    fund_for_merge = fund_for_merge.sort_values(['tic', 'datadate'])
+    fund_for_merge = fund_for_merge.sort_values(['datadate', 'tic'])
 
-    daily = daily.sort_values(['tic', 'datadate'])
+    daily = daily.sort_values(['datadate', 'tic'])
 
     merged = pd.merge_asof(
         daily,
