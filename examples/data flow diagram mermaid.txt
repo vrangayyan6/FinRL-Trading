@@ -1,0 +1,110 @@
+flowchart TD
+    %% Styles
+    classDef process fill:#f9f9f9,stroke:#333,stroke-width:1px
+    classDef data fill:#e1f5fe,stroke:#0277bd,stroke-width:1px
+    classDef storage fill:#fff3e0,stroke:#ef6c00,stroke-width:1px
+    classDef external fill:#e8f5e9,stroke:#2e7d32,stroke-width:1px
+
+    Start((Start))
+
+    %% Phase 1: Setup
+    subgraph Setup_Phase ["1. Environment Setup"]
+        Setup["Clone Repo and Install Deps"]:::process
+        Mount["Mount Google Drive"]:::process
+        API["Config API Keys"]:::process
+        Setup --> Mount --> API
+    end
+
+    Start --> Setup
+    API --> FetchTickers
+
+    %% Phase 2: Data
+    subgraph Data_Acquisition ["2. Data Acquisition"]
+        FetchTickers["Fetch S&P 500 Tickers"]:::process
+        Yahoo{"Yahoo Finance"}:::external
+        FetchFund["Fetch Fundamental Data"]:::process
+        FundDF("Fundamentals DataFrame"):::data
+        SaveFund[("Save fundamentals.csv")]:::storage
+
+        FetchTickers -.->|Request| Yahoo
+        Yahoo -.->|Tickers| FetchTickers
+        FetchTickers --> FetchFund
+        FetchFund -.->|Request| Yahoo
+        Yahoo -.->|Financials| FetchFund
+        FetchFund --> FundDF
+        FundDF --> SaveFund
+    end
+
+    SaveFund --> LoadFund
+
+    %% Phase 3: Strategy
+    subgraph Strategy_Phase ["3. ML Strategy"]
+        LoadFund["Load Fundamentals"]:::process
+        ConfigStrat["Configure ML Strategy"]:::process
+        SectorCheck{"Has Sector Data?"}:::process
+        StratSector["Sector Neutral ML Strategy"]:::process
+        StratBasic["Basic ML Strategy"]:::process
+        GenWeights["Generate Weights"]:::process
+        WeightsDF("Weights DataFrame"):::data
+        SaveWeights[("Save ml_weights.csv")]:::storage
+
+        LoadFund --> ConfigStrat
+        ConfigStrat --> SectorCheck
+        SectorCheck -- Yes --> StratSector
+        SectorCheck -- No --> StratBasic
+        StratSector --> GenWeights
+        StratBasic --> GenWeights
+        GenWeights --> WeightsDF
+        WeightsDF --> SaveWeights
+    end
+
+    SaveWeights --> LoadWeightsBT
+    SaveWeights --> LoadWeightsTrade
+
+    %% Phase 4: Backtest
+    subgraph Backtest_Phase ["4. Backtesting"]
+        LoadWeightsBT["Load Weights"]:::process
+        FetchPrices["Fetch Historical Prices"]:::process
+        PricesDF("Price Data"):::data
+        RunBT["Run Backtest Engine"]:::process
+        Metrics("Performance Metrics"):::data
+
+        LoadWeightsBT --> FetchPrices
+        FetchPrices -.->|Request| Yahoo
+        Yahoo -.->|Prices| FetchPrices
+        FetchPrices --> PricesDF
+        PricesDF --> RunBT
+        RunBT --> Metrics
+    end
+
+    %% Phase 5: Trading
+    subgraph Trading_Phase ["5. Paper Trading"]
+        LoadWeightsTrade["Load Weights"]:::process
+        InitExec["Init Trade Executor"]:::process
+        Alpaca{"Alpaca API"}:::external
+        CalcRebal["Calculate Rebalance"]:::process
+        DryRun["Dry Run Plan"]:::data
+        ExecTrades["Execute Trades"]:::process
+
+        LoadWeightsTrade --> InitExec
+        InitExec --> CalcRebal
+        CalcRebal --> DryRun
+        DryRun --> ExecTrades
+        ExecTrades <-->|Orders/Positions| Alpaca
+    end
+
+    ExecTrades --> FetchHistory
+
+    %% Phase 6: Analysis
+    subgraph Analysis_Phase ["6. Performance Analysis"]
+        FetchHistory["Fetch Portfolio History"]:::process
+        FetchBench["Fetch Benchmark Data"]:::process
+        Plot["Plot Performance"]:::process
+        
+        FetchHistory <-->|History| Alpaca
+        FetchBench -.->|SPY/QQQ| Yahoo
+        FetchHistory --> Plot
+        FetchBench --> Plot
+    end
+
+    Plot --> End((End))

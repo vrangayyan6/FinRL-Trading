@@ -437,7 +437,7 @@ class AlpacaManager:
             market_value = float(position['market_value'])
             current_weights[symbol] = (market_value / portfolio_value) if portfolio_value > 0 else 0.0
 
-        # Filter与规范化: 仅保留可交易标的；负权重视为0；必要时归一化到<=1
+        # Filter logic: filter out non-tradable, set weight to 0 if invalid, ensure sum <=1
         filtered_targets: Dict[str, float] = {}
         raw_targets = target_weights or {}
         for s, w in raw_targets.items():
@@ -457,11 +457,11 @@ class AlpacaManager:
         sum_w = sum(filtered_targets.values())
         used_target_weights: Dict[str, float]
         if sum_w > 1.0001:
-            # 若权重和>1，按总和进行缩放归一化
+            # If total weight > 1, normalize proportionally
             used_target_weights = {s: (w / sum_w) for s, w in filtered_targets.items()}
             self.logger.info(f"Target weights sum {sum_w:.6f} > 1; normalized to 1.0 proportionally")
         else:
-            # 和<=1则保留，允许剩余现金
+            # If total weight <= 1, keep as is (remainder is cash)
             used_target_weights = dict(filtered_targets)
 
         all_symbols = set(current_weights.keys()) | set(used_target_weights.keys())
@@ -746,7 +746,15 @@ class AlpacaManager:
         if account is None:
             account = self._get_account()
 
-        url = f"{account.base_url}{path}"
+        # Robustly handle base URL formatting
+        # 1. Strip whitespace
+        # 2. Remove trailing slash
+        # 3. Remove trailing /v2 if present (since path includes /v2)
+        base_url = account.base_url.strip().rstrip('/')
+        if base_url.endswith('/v2'):
+            base_url = base_url[:-3]
+
+        url = f"{base_url}{path}"
         headers = {
             'APCA-API-KEY-ID': account.api_key,
             'APCA-API-SECRET-KEY': account.api_secret,
@@ -761,7 +769,7 @@ class AlpacaManager:
 
             if response.status_code >= 400:
                 error_info = response.json() if response.headers.get('content-type', '').startswith('application/json') else {'message': response.text}
-                raise RuntimeError(f"Alpaca API error {response.status_code}: {error_info}")
+                raise RuntimeError(f"Alpaca API error {response.status_code}: {error_info} (URL: {url})")
 
             if response.status_code == 204:  # No content
                 return {}
@@ -886,6 +894,21 @@ def create_alpaca_account_from_env(name: str = "default") -> AlpacaAccount:
     api_secret = config.alpaca.api_secret
     base_url = config.alpaca.base_url
 
+    # Fallback to environment variables if not found in config
+    # Supports both standard Alpaca vars (APCA_) and Notebook vars (ALPACA_)
+    if not api_key:
+        api_key = os.environ.get("ALPACA_API_KEY") or os.environ.get("APCA_API_KEY_ID") or os.environ.get("APCA_API_KEY")
+    if not api_secret:
+        api_secret = os.environ.get("ALPACA_SECRET_KEY") or os.environ.get("APCA_API_SECRET_KEY") or os.environ.get("APCA_API_SECRET")
+    if not base_url:
+        base_url = os.environ.get("ALPACA_BASE_URL") or os.environ.get("APCA_API_BASE_URL") or "https://paper-api.alpaca.markets"
+
+    # Clean base URL
+    if base_url:
+        base_url = base_url.strip().rstrip('/')
+        if base_url.endswith('/v2'):
+            base_url = base_url[:-3]
+
     if not api_key or not api_secret:
         raise ValueError("Alpaca API credentials not found in environment variables")
 
@@ -909,11 +932,17 @@ def create_multiple_accounts_from_config(config: Dict[str, Dict]) -> List[Alpaca
     """
     accounts = []
     for name, settings in config.items():
+        base_url = settings.get('base_url', 'https://paper-api.alpaca.markets')
+        if base_url:
+            base_url = base_url.strip().rstrip('/')
+            if base_url.endswith('/v2'):
+                base_url = base_url[:-3]
+
         accounts.append(AlpacaAccount(
             name=name,
             api_key=settings['api_key'],
             api_secret=settings['api_secret'],
-            base_url=settings.get('base_url', 'https://paper-api.alpaca.markets')
+            base_url=base_url
         ))
 
     return accounts
