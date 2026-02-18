@@ -467,14 +467,12 @@ if __name__ == "__main__":
         print("Trade executor initialized successfully")
         print(f"Available accounts: {executor.alpaca.get_available_accounts()}")
 
-        # Load latest weights from data/ml_weights.csv and execute rebalance
-        weights_path = Path("data/ml_weights.csv")
-        if not weights_path.exists():
-            raise FileNotFoundError(f"Weights file not found: {weights_path}")
-
-        df = pd.read_csv(weights_path)
-        if "date" not in df.columns or "gvkey" not in df.columns or "weight" not in df.columns:
-            raise ValueError("ml_weights.csv should have columns: date, gvkey, weight")
+        # Load latest weights from SQLite database
+        from src.data.data_store import get_data_store
+        ds = get_data_store()
+        df = ds.get_ml_weights()
+        if df.empty:
+            raise ValueError("No ML weights found in database. Run ML stock selection first.")
 
         # Parse date and get latest
         df["date"] = pd.to_datetime(df["date"]).dt.date

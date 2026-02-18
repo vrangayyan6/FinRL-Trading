@@ -540,11 +540,12 @@ if __name__ == "__main__":
     # 示例：读取选股权重文件（gvkey 作为 ticker，weight 为权重，date 为目标调仓日）
     logging.basicConfig(level=logging.INFO)
 
-    # 1) 读取权重 csv（示例路径：data/ml_weights_single.csv）
-    weights_csv_path = Path(project_root) / 'data' / 'ml_weights.csv'
-    weights_raw = pd.read_csv(weights_csv_path)
-    if 'date' not in weights_raw.columns or 'gvkey' not in weights_raw.columns or 'weight' not in weights_raw.columns:
-        raise ValueError("权重文件缺少必要列：date / gvkey / weight")
+    # 1) Load weights from SQLite database
+    from src.data.data_store import get_data_store
+    ds = get_data_store()
+    weights_raw = ds.get_ml_weights()
+    if weights_raw.empty:
+        raise ValueError("No ML weights found in database. Run ML stock selection first.")
 
     # 统一类型与排序
     weights_raw['date'] = pd.to_datetime(weights_raw['date'])

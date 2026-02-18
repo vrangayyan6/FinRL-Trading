@@ -156,6 +156,93 @@ class DataStore:
             ''')
 
 
+            # Create fundamentals table (quarterly financial ratios)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS fundamentals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    gvkey TEXT,
+                    adj_close_q REAL,
+                    eps REAL,
+                    bps REAL,
+                    dps REAL,
+                    cur_ratio REAL,
+                    quick_ratio REAL,
+                    cash_ratio REAL,
+                    acc_rec_turnover REAL,
+                    debt_ratio REAL,
+                    debt_to_equity REAL,
+                    pe REAL,
+                    ps REAL,
+                    pb REAL,
+                    roe REAL,
+                    net_income_ratio REAL,
+                    y_return REAL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(ticker, date)
+                )
+            ''')
+
+            # Create daily features table (merged daily technicals + quarterly fundamentals)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS daily_features (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    gvkey TEXT,
+                    adj_close REAL,
+                    prccd REAL,
+                    prcod REAL,
+                    prchd REAL,
+                    prcld REAL,
+                    cshtrd REAL,
+                    daily_return REAL,
+                    momentum_5d REAL,
+                    momentum_10d REAL,
+                    momentum_20d REAL,
+                    volatility_20d REAL,
+                    volatility_60d REAL,
+                    sma_5 REAL,
+                    sma_10 REAL,
+                    sma_20 REAL,
+                    sma_50 REAL,
+                    sma_200 REAL,
+                    rsi_14 REAL,
+                    macd REAL,
+                    macd_signal REAL,
+                    eps REAL,
+                    bps REAL,
+                    dps REAL,
+                    cur_ratio REAL,
+                    quick_ratio REAL,
+                    cash_ratio REAL,
+                    acc_rec_turnover REAL,
+                    debt_ratio REAL,
+                    debt_to_equity REAL,
+                    pe REAL,
+                    ps REAL,
+                    pb REAL,
+                    roe REAL,
+                    net_income_ratio REAL,
+                    y_return REAL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(ticker, date)
+                )
+            ''')
+
+            # Create ML weights table (daily stock selection output)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS ml_weights (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    weight REAL NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(ticker, date)
+                )
+            ''')
+
             conn.commit()
             logger.info(f"Initialized database at {self.db_path}")
 
@@ -690,11 +777,22 @@ class DataStore:
             cursor.execute("SELECT COUNT(*) FROM price_data")
             price_count = cursor.fetchone()[0]
 
+            cursor.execute("SELECT COUNT(*) FROM fundamentals")
+            fundamentals_count = cursor.fetchone()[0]
+
+            cursor.execute("SELECT COUNT(*) FROM daily_features")
+            daily_features_count = cursor.fetchone()[0]
+
+            cursor.execute("SELECT COUNT(*) FROM ml_weights")
+            ml_weights_count = cursor.fetchone()[0]
+
         return {
             'total_files': file_count,
             'total_size_mb': total_size / (1024 * 1024),
             'price_records': price_count,
-            # 'data_objects': objects_count,
+            'fundamentals_records': fundamentals_count,
+            'daily_features_records': daily_features_count,
+            'ml_weights_records': ml_weights_count,
             'database_path': str(self.db_path)
         }
 
@@ -861,6 +959,309 @@ class DataStore:
             )
             row = cursor.fetchone()
             return row[0] if row else None
+
+    # =========================
+    # Fundamentals helpers
+    # =========================
+
+    # Column mapping: notebook names → DB column names
+    _FUND_COLUMN_MAP_IN = {
+        'tic': 'ticker', 'datadate': 'date',
+        'EPS': 'eps', 'BPS': 'bps', 'DPS': 'dps',
+    }
+    _FUND_COLUMN_MAP_OUT = {v: k for k, v in _FUND_COLUMN_MAP_IN.items()}
+
+    _FUND_DB_COLUMNS = [
+        'ticker', 'date', 'gvkey', 'adj_close_q',
+        'eps', 'bps', 'dps', 'cur_ratio', 'quick_ratio', 'cash_ratio',
+        'acc_rec_turnover', 'debt_ratio', 'debt_to_equity',
+        'pe', 'ps', 'pb', 'roe', 'net_income_ratio', 'y_return',
+    ]
+
+    def save_fundamentals(self, df: pd.DataFrame) -> int:
+        """Save quarterly fundamental data to database (upsert).
+
+        Args:
+            df: DataFrame with notebook-style columns (tic, datadate, EPS, BPS, ...).
+
+        Returns:
+            Number of rows inserted/updated.
+        """
+        if df is None or df.empty:
+            return 0
+
+        df = df.copy()
+        for old, new in self._FUND_COLUMN_MAP_IN.items():
+            if old in df.columns and new not in df.columns:
+                df = df.rename(columns={old: new})
+
+        if 'date' in df.columns and len(df) > 0 and not isinstance(df['date'].iloc[0], str):
+            df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+
+        # Ensure all expected columns exist
+        for col in self._FUND_DB_COLUMNS:
+            if col not in df.columns:
+                df[col] = np.nan
+
+        # Replace NaN with None for SQLite
+        df_db = df[self._FUND_DB_COLUMNS].where(df[self._FUND_DB_COLUMNS].notna(), None)
+        rows = [tuple(r) for r in df_db.values.tolist()]
+
+        placeholders = ', '.join(['?' for _ in self._FUND_DB_COLUMNS])
+        col_names = ', '.join(self._FUND_DB_COLUMNS)
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.executemany(
+                f'INSERT OR REPLACE INTO fundamentals ({col_names}) VALUES ({placeholders})',
+                rows,
+            )
+            conn.commit()
+
+        logger.info(f"Saved {len(rows)} fundamentals records to database")
+        return len(rows)
+
+    def get_fundamentals(self, tickers: List[str] = None) -> pd.DataFrame:
+        """Load quarterly fundamental data from database.
+
+        Args:
+            tickers: Optional list of tickers to filter. Returns all if None.
+
+        Returns:
+            DataFrame with notebook-style columns (tic, datadate, EPS, BPS, ...).
+        """
+        col_names = ', '.join(self._FUND_DB_COLUMNS)
+
+        if tickers:
+            placeholders = ', '.join(['?' for _ in tickers])
+            query = f'SELECT {col_names} FROM fundamentals WHERE ticker IN ({placeholders}) ORDER BY ticker, date'
+            params = list(tickers)
+        else:
+            query = f'SELECT {col_names} FROM fundamentals ORDER BY ticker, date'
+            params = []
+
+        with sqlite3.connect(self.db_path) as conn:
+            df = pd.read_sql_query(query, conn, params=params)
+
+        if not df.empty:
+            df = df.rename(columns=self._FUND_COLUMN_MAP_OUT)
+
+        return df
+
+    def get_fundamentals_coverage(self, tickers_list: List[str]) -> Dict:
+        """Check fundamentals table coverage for cache validation.
+
+        Args:
+            tickers_list: Full list of expected tickers.
+
+        Returns:
+            Dict with total_rows, unique_tickers, coverage_pct, has_y_return,
+            date_min, date_max.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                SELECT COUNT(*) as cnt,
+                       COUNT(DISTINCT ticker) as n_tickers,
+                       MIN(date) as date_min,
+                       MAX(date) as date_max,
+                       SUM(CASE WHEN y_return IS NOT NULL THEN 1 ELSE 0 END) as y_count
+                FROM fundamentals
+            ''')
+            row = cursor.fetchone()
+            total_rows, n_tickers, date_min, date_max, y_count = row
+
+            cursor.execute('SELECT DISTINCT ticker FROM fundamentals')
+            db_tickers = {r[0] for r in cursor.fetchall()}
+
+        covered = sum(1 for t in tickers_list if t in db_tickers)
+        coverage_pct = (covered / len(tickers_list) * 100) if tickers_list else 0
+
+        return {
+            'total_rows': total_rows,
+            'unique_tickers': n_tickers,
+            'coverage_pct': coverage_pct,
+            'has_y_return': (y_count or 0) > 0,
+            'date_min': date_min,
+            'date_max': date_max,
+        }
+
+    # =========================
+    # Daily features helpers
+    # =========================
+
+    _DAILY_COLUMN_MAP_IN = {
+        'tic': 'ticker', 'datadate': 'date',
+        'EPS': 'eps', 'BPS': 'bps', 'DPS': 'dps',
+    }
+    _DAILY_COLUMN_MAP_OUT = {v: k for k, v in _DAILY_COLUMN_MAP_IN.items()}
+
+    _DAILY_DB_COLUMNS = [
+        'ticker', 'date', 'gvkey', 'adj_close',
+        'prccd', 'prcod', 'prchd', 'prcld', 'cshtrd',
+        'daily_return', 'momentum_5d', 'momentum_10d', 'momentum_20d',
+        'volatility_20d', 'volatility_60d',
+        'sma_5', 'sma_10', 'sma_20', 'sma_50', 'sma_200',
+        'rsi_14', 'macd', 'macd_signal',
+        'eps', 'bps', 'dps', 'cur_ratio', 'quick_ratio', 'cash_ratio',
+        'acc_rec_turnover', 'debt_ratio', 'debt_to_equity',
+        'pe', 'ps', 'pb', 'roe', 'net_income_ratio', 'y_return',
+    ]
+
+    _DAILY_CHUNK_SIZE = 10000
+
+    def save_daily_features(self, df: pd.DataFrame) -> int:
+        """Save merged daily technical + fundamental features to database (upsert).
+
+        Args:
+            df: DataFrame with ~38 columns from compute_daily_features + merge.
+
+        Returns:
+            Number of rows inserted/updated.
+        """
+        if df is None or df.empty:
+            return 0
+
+        df = df.copy()
+        for old, new in self._DAILY_COLUMN_MAP_IN.items():
+            if old in df.columns and new not in df.columns:
+                df = df.rename(columns={old: new})
+
+        if 'date' in df.columns and len(df) > 0 and not isinstance(df['date'].iloc[0], str):
+            df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+
+        for col in self._DAILY_DB_COLUMNS:
+            if col not in df.columns:
+                df[col] = np.nan
+
+        # Replace NaN with None for SQLite
+        df_db = df[self._DAILY_DB_COLUMNS].where(df[self._DAILY_DB_COLUMNS].notna(), None)
+        all_rows = df_db.values.tolist()
+
+        placeholders = ', '.join(['?' for _ in self._DAILY_DB_COLUMNS])
+        col_names = ', '.join(self._DAILY_DB_COLUMNS)
+        sql = f'INSERT OR REPLACE INTO daily_features ({col_names}) VALUES ({placeholders})'
+
+        rows_affected = 0
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            for i in range(0, len(all_rows), self._DAILY_CHUNK_SIZE):
+                chunk = [tuple(r) for r in all_rows[i:i + self._DAILY_CHUNK_SIZE]]
+                cursor.executemany(sql, chunk)
+                rows_affected += len(chunk)
+            conn.commit()
+
+        logger.info(f"Saved {rows_affected} daily feature records to database")
+        return rows_affected
+
+    def get_daily_features(
+        self,
+        tickers: List[str] = None,
+        start_date: str = None,
+        end_date: str = None,
+    ) -> pd.DataFrame:
+        """Load daily features from database.
+
+        Args:
+            tickers: Optional ticker filter.
+            start_date: Optional start date (YYYY-MM-DD).
+            end_date: Optional end date (YYYY-MM-DD).
+
+        Returns:
+            DataFrame with notebook-style columns (tic, datadate, EPS, ...).
+        """
+        col_names = ', '.join(self._DAILY_DB_COLUMNS)
+        conditions = []
+        params: list = []
+
+        if tickers:
+            placeholders = ', '.join(['?' for _ in tickers])
+            conditions.append(f'ticker IN ({placeholders})')
+            params.extend(tickers)
+        if start_date:
+            conditions.append('date >= ?')
+            params.append(start_date)
+        if end_date:
+            conditions.append('date <= ?')
+            params.append(end_date)
+
+        where = (' WHERE ' + ' AND '.join(conditions)) if conditions else ''
+        query = f'SELECT {col_names} FROM daily_features{where} ORDER BY ticker, date'
+
+        with sqlite3.connect(self.db_path) as conn:
+            df = pd.read_sql_query(query, conn, params=params)
+
+        if not df.empty:
+            df = df.rename(columns=self._DAILY_COLUMN_MAP_OUT)
+
+        return df
+
+    # =========================
+    # ML weights helpers
+    # =========================
+
+    def save_ml_weights(self, df: pd.DataFrame) -> int:
+        """Save ML stock selection weights to database (upsert).
+
+        Args:
+            df: DataFrame with columns date, gvkey, weight.
+
+        Returns:
+            Number of rows inserted/updated.
+        """
+        if df is None or df.empty:
+            return 0
+
+        df = df.copy()
+        if 'gvkey' in df.columns and 'ticker' not in df.columns:
+            df = df.rename(columns={'gvkey': 'ticker'})
+
+        if 'date' in df.columns and len(df) > 0 and not isinstance(df['date'].iloc[0], str):
+            df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+
+        rows = []
+        for _, row in df.iterrows():
+            rows.append((
+                str(row['ticker']),
+                str(row['date']),
+                float(row['weight']) if pd.notna(row['weight']) else 0.0,
+            ))
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.executemany(
+                'INSERT OR REPLACE INTO ml_weights (ticker, date, weight) VALUES (?, ?, ?)',
+                rows,
+            )
+            conn.commit()
+
+        logger.info(f"Saved {len(rows)} ML weight records to database")
+        return len(rows)
+
+    def get_ml_weights(self, date: str = None) -> pd.DataFrame:
+        """Load ML stock selection weights from database.
+
+        Args:
+            date: Optional date filter (YYYY-MM-DD). Returns all rows if None.
+
+        Returns:
+            DataFrame with columns [date, gvkey, weight].
+        """
+        if date:
+            query = 'SELECT date, ticker, weight FROM ml_weights WHERE date = ? ORDER BY ticker'
+            params = [date]
+        else:
+            query = 'SELECT date, ticker, weight FROM ml_weights ORDER BY date, ticker'
+            params = []
+
+        with sqlite3.connect(self.db_path) as conn:
+            df = pd.read_sql_query(query, conn, params=params)
+
+        if not df.empty:
+            df = df.rename(columns={'ticker': 'gvkey'})
+
+        return df
 
 
 # Global data store instance
